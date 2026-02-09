@@ -249,23 +249,31 @@ class RetryingPooledMySQLDatabase(PooledMySQLDatabase):
         for attempt in range(self.max_retries + 1):
             try:
                 return super().execute_sql(sql, params, commit)
-            except (OperationalError, InterfaceError) as e:
+            except (OperationalError, InterfaceError, ValueError) as e:
                 error_codes = [2013, 2006]
-                error_messages = ['', 'Lost connection']
+                error_messages = ['', 'Lost connection', 'read of closed file']
+                
+                # 提取错误信息
+                error_args = getattr(e, 'args', [])
+                error_code = error_args[0] if error_args else None
+                error_msg = str(e)
+                
                 should_retry = (
-                    (hasattr(e, 'args') and e.args and e.args[0] in error_codes) or
-                    (str(e) in error_messages) or
-                    (hasattr(e, '__class__') and e.__class__.__name__ == 'InterfaceError')
+                    (error_code in error_codes) or
+                    (error_msg in error_messages) or
+                    (hasattr(e, '__class__') and e.__class__.__name__ == 'InterfaceError') or
+                    ('read of closed file' in error_msg)
                 )
 
                 if should_retry and attempt < self.max_retries:
                     logging.warning(
-                        f"Database connection issue (attempt {attempt+1}/{self.max_retries}): {e}"
+                        f"Database connection issue (attempt {attempt+1}/{self.max_retries}): "
+                        f"code={error_code}, message={error_msg}"
                     )
                     self._handle_connection_loss()
                     time.sleep(self.retry_delay * (2 ** attempt))
                 else:
-                    logging.error(f"DB execution failure: {e}")
+                    logging.error(f"DB execution failure: code={error_code}, message={error_msg}")
                     raise
         return None
 

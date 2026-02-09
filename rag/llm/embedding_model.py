@@ -641,6 +641,23 @@ class OpenAI_APIEmbed(OpenAIEmbed):
         self.client = OpenAI(api_key=key, base_url=base_url)
         self.model_name = model_name.split("___")[0]
 
+    def encode(self, texts: list):
+        # OpenAI requires batch size <=16
+        batch_size = 16
+        # 确保每个输入都被截断到模型的最大 token 限制
+        texts = [truncate(t, 8191) for t in texts]
+        ress = []
+        total_tokens = 0
+        for i in range(0, len(texts), batch_size):
+            res = self.client.embeddings.create(input=texts[i : i + batch_size], model=self.model_name, encoding_format="float")
+            try:
+                ress.extend([d.embedding for d in res.data])
+                total_tokens += total_token_count_from_response(res)
+            except Exception as _e:
+                log_exception(_e, res)
+                raise Exception(f"Error: {res}")
+        return np.array(ress), total_tokens
+
 
 class CoHereEmbed(Base):
     _FACTORY_NAME = "Cohere"

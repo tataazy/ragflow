@@ -597,8 +597,12 @@ class RAGFlowPdfParser:
         self.boxes, self.page_layout = self.layouter(self.page_images, self.boxes, ZM, drop=drop)
         # cumlative Y
         for i in range(len(self.boxes)):
-            self.boxes[i]["top"] += self.page_cum_height[self.boxes[i]["page_number"] - 1]
-            self.boxes[i]["bottom"] += self.page_cum_height[self.boxes[i]["page_number"] - 1]
+            page_idx = self.boxes[i]["page_number"] - 1
+            if 0 <= page_idx < len(self.page_cum_height):
+                self.boxes[i]["top"] += self.page_cum_height[page_idx]
+                self.boxes[i]["bottom"] += self.page_cum_height[page_idx]
+            else:
+                logging.warning(f"Invalid page index {page_idx} when updating box positions, skipping")
 
     def _assign_column(self, boxes, zoomin=3):
         if not boxes:
@@ -711,11 +715,13 @@ class RAGFlowPdfParser:
                 i += 1
                 continue
 
-            if abs(self._y_dis(b, b_)) < self.mean_height[bxs[i]["page_number"] - 1] / 3:
-                # merge
-                bxs[i]["x1"] = b_["x1"]
-                bxs[i]["top"] = (b["top"] + b_["top"]) / 2
-                bxs[i]["bottom"] = (b["bottom"] + b_["bottom"]) / 2
+            page_idx = bxs[i]["page_number"] - 1
+            if 0 <= page_idx < len(self.mean_height):
+                if abs(self._y_dis(b, b_)) < self.mean_height[page_idx] / 3:
+                    # merge
+                    bxs[i]["x1"] = b_["x1"]
+                    bxs[i]["top"] = (b["top"] + b_["top"]) / 2
+                    bxs[i]["bottom"] = (b["bottom"] + b_["bottom"]) / 2
                 bxs[i]["text"] += b_["text"]
                 bxs.pop(i + 1)
                 continue
@@ -775,8 +781,8 @@ class RAGFlowPdfParser:
                     b.get("layoutno", 0) != b_.get("layoutno", 0),
                     b["text"].strip()[-1] in "。？！?",
                     self.is_english and b["text"].strip()[-1] in ".!?",
-                    b["page_number"] == b_["page_number"] and b_["top"] - b["bottom"] > self.mean_height[b["page_number"] - 1] * 1.5,
-                    b["page_number"] < b_["page_number"] and abs(b["x0"] - b_["x0"]) > self.mean_width[b["page_number"] - 1] * 4,
+                    (b["page_number"] == b_["page_number"] and 0 <= b["page_number"] - 1 < len(self.mean_height) and b_["top"] - b["bottom"] > self.mean_height[b["page_number"] - 1] * 1.5),
+                    (b["page_number"] < b_["page_number"] and 0 <= b["page_number"] - 1 < len(self.mean_width) and abs(b["x0"] - b_["x0"]) > self.mean_width[b["page_number"] - 1] * 4),
                 ]
                 # split features
                 detach_feats = [b["x1"] < b_["x0"], b["x0"] > b_["x1"]]
@@ -832,7 +838,13 @@ class RAGFlowPdfParser:
 
         # count boxes in the same row as a feature
         for i in range(len(self.boxes)):
-            mh = self.mean_height[self.boxes[i]["page_number"] - 1]
+            page_idx = self.boxes[i]["page_number"] - 1
+            # 检查mean_height边界
+            if page_idx < 0 or page_idx >= len(self.mean_height):
+                logging.warning(f"Invalid page index {page_idx} in _concat_downward, using default mean height")
+                mh = 1.0  # 默认值
+            else:
+                mh = self.mean_height[page_idx]
             self.boxes[i]["in_row"] = 0
             j = max(0, i - 12)
             while j < min(i + 12, len(self.boxes)):
@@ -858,8 +870,14 @@ class RAGFlowPdfParser:
                 while i < min(dp + 12, len(boxes)):
                     ydis = self._y_dis(up, boxes[i])
                     smpg = up["page_number"] == boxes[i]["page_number"]
-                    mh = self.mean_height[up["page_number"] - 1]
-                    mw = self.mean_width[up["page_number"] - 1]
+                    page_idx = up["page_number"] - 1
+                    if 0 <= page_idx < len(self.mean_height) and 0 <= page_idx < len(self.mean_width):
+                        mh = self.mean_height[page_idx]
+                        mw = self.mean_width[page_idx]
+                    else:
+                        mh = 1.0
+                        mw = 1.0
+                        logging.warning(f"Invalid page index {page_idx} in _assign_column, using default values")
                     if smpg and ydis > mh * 4:
                         break
                     if not smpg and ydis > mh * 16:
@@ -965,7 +983,11 @@ class RAGFlowPdfParser:
         page_dirty = [0] * len(self.page_images)
         for b in self.boxes:
             if re.search(r"(··|··|··)", b["text"]):
-                page_dirty[b["page_number"] - 1] += 1
+                page_idx = b["page_number"] - 1
+                if 0 <= page_idx < len(page_dirty):
+                    page_dirty[page_idx] += 1
+                else:
+                    logging.warning(f"Invalid page index {page_idx} in _text_merge, skipping")
         page_dirty = set([i + 1 for i, t in enumerate(page_dirty) if t > 3])
         if not page_dirty:
             return
@@ -1053,8 +1075,14 @@ class RAGFlowPdfParser:
                 continue
             if bxs[0]["page_number"] - bxs0[0]["page_number"] > 1:
                 continue
-            mh = self.mean_height[bxs[0]["page_number"] - 1]
-            if self._y_dis(bxs0[-1], bxs[0]) > mh * 23:
+            page_idx = bxs[0]["page_number"] - 1
+            if 0 <= page_idx < len(self.mean_height):
+                mh = self.mean_height[page_idx]
+                if self._y_dis(bxs0[-1], bxs[0]) > mh * 23:
+                    continue
+            else:
+                # Skip if page index is invalid
+                logging.warning(f"Invalid page index {page_idx} in _extract_table_figure, skipping merge")
                 continue
             tables[k0].extend(tables[k])
             del tables[k]
@@ -1106,6 +1134,22 @@ class RAGFlowPdfParser:
             pn = set([b["page_number"] - 1 for b in bxs])
             if len(pn) < 2:
                 pn = list(pn)[0]
+
+                # 添加边界检查
+                if pn >= len(self.page_cum_height):
+                    logging.warning(f"Page index {pn} exceeds page_cum_height length {len(self.page_cum_height)}, using last available page")
+                    pn = min(pn, len(self.page_cum_height) - 1)
+
+                # 检查page_layout边界
+                if pn >= len(self.page_layout):
+                    logging.warning(f"Page index {pn} exceeds page_layout length {len(self.page_layout)}, using last available page")
+                    pn = min(pn, len(self.page_layout) - 1)
+
+                # 检查page_images边界
+                if pn >= len(self.page_images):
+                    logging.warning(f"Page index {pn} exceeds page_images length {len(self.page_images)}, using last available page")
+                    pn = min(pn, len(self.page_images) - 1)
+
                 ht = self.page_cum_height[pn]
                 b = {"x0": np.min([b["x0"] for b in bxs]), "top": np.min([b["top"] for b in bxs]) - ht, "x1": np.max([b["x1"] for b in bxs]), "bottom": np.max([b["bottom"] for b in bxs]) - ht}
                 louts = [layout for layout in self.page_layout[pn] if layout["type"] == ltype]
@@ -1120,12 +1164,18 @@ class RAGFlowPdfParser:
                     right = left + 1
                 poss.append((pn + self.page_from, left, right, top, bott))
                 return self.page_images[pn].crop((left * ZM, top * ZM, right * ZM, bott * ZM))
+
             pn = {}
             for b in bxs:
                 p = b["page_number"] - 1
-                if p not in pn:
-                    pn[p] = []
-                pn[p].append(b)
+                # 检查页面索引是否有效
+                if p < len(self.page_cum_height):
+                    if p not in pn:
+                        pn[p] = []
+                    pn[p].append(b)
+                else:
+                    logging.warning(f"Skipping invalid page index {p}, max allowed: {len(self.page_cum_height) - 1}")
+
             pn = sorted(pn.items(), key=lambda x: x[0])
             imgs = [cropout(arr, ltype, poss) for p, arr in pn]
             pic = Image.new("RGB", (int(np.max([i.size[0] for i in imgs])), int(np.sum([m.size[1] for m in imgs]))), (245, 245, 245))
@@ -1203,8 +1253,13 @@ class RAGFlowPdfParser:
 
     def _line_tag(self, bx, ZM):
         pn = [bx["page_number"]]
-        top = bx["top"] - self.page_cum_height[pn[0] - 1]
-        bott = bx["bottom"] - self.page_cum_height[pn[0] - 1]
+        page_idx = pn[0] - 1
+        # 检查page_cum_height边界
+        if page_idx < 0 or page_idx >= len(self.page_cum_height):
+            logging.warning(f"Invalid page index {page_idx} in _line_tag, returning empty tag")
+            return ""
+        top = bx["top"] - self.page_cum_height[page_idx]
+        bott = bx["bottom"] - self.page_cum_height[page_idx]
         page_images_cnt = len(self.page_images)
         if pn[-1] - 1 >= page_images_cnt:
             return ""
@@ -1226,9 +1281,10 @@ class RAGFlowPdfParser:
         def usefull(b):
             if b.get("layout_type"):
                 return True
-            if width(b) > self.page_images[b["page_number"] - 1].size[0] / ZM / 3:
+            page_idx = b["page_number"] - 1
+            if 0 <= page_idx < len(self.page_images) and width(b) > self.page_images[page_idx].size[0] / ZM / 3:
                 return True
-            if b["bottom"] - b["top"] > self.mean_height[b["page_number"] - 1]:
+            if 0 <= page_idx < len(self.mean_height) and b["bottom"] - b["top"] > self.mean_height[page_idx]:
                 return True
             return False
 
@@ -1236,8 +1292,14 @@ class RAGFlowPdfParser:
         while boxes:
             lines = []
             widths = []
-            pw = self.page_images[boxes[0]["page_number"] - 1].size[0] / ZM
-            mh = self.mean_height[boxes[0]["page_number"] - 1]
+            page_idx = boxes[0]["page_number"] - 1
+            if 0 <= page_idx < len(self.page_images) and 0 <= page_idx < len(self.mean_height):
+                pw = self.page_images[page_idx].size[0] / ZM
+                mh = self.mean_height[page_idx]
+            else:
+                pw = 1000  # 默认值
+                mh = 1.0  # 默认值
+                logging.warning(f"Invalid page index {page_idx} in __filterout_scraps, using default values")
             mj = self.proj_match(boxes[0]["text"]) or boxes[0].get("layout_type", "") == "title"
 
             def dfs(line, st):

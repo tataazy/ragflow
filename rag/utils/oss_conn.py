@@ -15,6 +15,7 @@
 
 import logging
 import boto3
+from botocore.config import Config  # 新增这行
 from botocore.exceptions import ClientError
 import time
 from io import BytesIO
@@ -35,6 +36,14 @@ class RAGFlowOSS:
         self.prefix_path = self.oss_config.get('prefix_path', None)
         self.signature_version = self.oss_config.get('signature_version', None)
         self.addressing_style = self.oss_config.get('addressing_style', None)
+        valid_signature_versions = [None, 's3', 's3v4', 'v4']
+        if self.signature_version not in valid_signature_versions:
+            logging.warning(f"Invalid signature_version: {self.signature_version}, use default instead")
+            self.signature_version = None
+        valid_addressing_styles = [None, 'path', 'virtual']
+        if self.addressing_style not in valid_addressing_styles:
+            logging.warning(f"Invalid addressing_style: {self.addressing_style}, use default instead")
+            self.addressing_style = None
         self.__open__()
 
     @staticmethod
@@ -67,19 +76,23 @@ class RAGFlowOSS:
 
             if self.signature_version:
                 config_kwargs['signature_version'] = self.signature_version
-            if self.addressing_style:
-                config_kwargs['s3'] = {
-                    'addressing_style': self.addressing_style
-                }
 
-            # Reference：https://help.aliyun.com/zh/oss/developer-reference/use-amazon-s3-sdks-to-access-oss
+            # addressing_style 需要在 Config 中单独设置
+            if self.addressing_style:
+                s3_config = {'addressing_style': self.addressing_style}
+                config_kwargs['s3'] = s3_config
+
+            config = Config(**config_kwargs) if config_kwargs else None
+
+
+        # Reference：https://help.aliyun.com/zh/oss/developer-reference/use-amazon-s3-sdks-to-access-oss
             self.conn = boto3.client(
                 's3',
                 region_name=self.region,
                 aws_access_key_id=self.access_key,
                 aws_secret_access_key=self.secret_key,
                 endpoint_url=self.endpoint_url,
-                config=config_kwargs
+                config=config
             )
         except Exception:
             logging.exception(f"Fail to connect at region {self.region}")

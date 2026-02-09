@@ -23,6 +23,38 @@ es:
   hosts: 'http://${ES_HOST:-es01}:9200'
   username: '${ES_USER:-elastic}'
   password: '${ELASTIC_PASSWORD:-infini_rag_flow}'
+  max_conn_total: 200
+  max_conn_per_route: 50
+  timeout: 30000
+  vector_index:
+    hnsw:
+      m: 32
+      ef_construction: 400
+    query:
+      num_candidates: 500
+      k: 100
+  index_template:
+    settings:
+      number_of_shards: 8
+      number_of_replicas: 0
+      refresh_interval: 60s
+      translog:
+        durability: async
+        sync_interval: 60s
+        flush_threshold_size: 2gb
+    mappings:
+      dynamic_templates:
+        - dense_vector:
+            match_pattern: regex
+            match: "^.*_vec$"
+            mapping:
+              type: dense_vector
+              index: true
+              similarity: cosine
+              index_options:
+                type: int8_hnsw
+                m: 32
+                ef_construction: 400
 os:
   hosts: 'http://${OS_HOST:-opensearch01}:9201'
   username: '${OS_USER:-admin}'
@@ -75,15 +107,15 @@ user_default_llm:
 #   prefix_path: 'prefix_path'
 #   signature_version: 'v4'
 #   addressing_style: 'path'
-# oss:
-#   access_key: '${ACCESS_KEY}'
-#   secret_key: '${SECRET_KEY}'
-#   endpoint_url: '${ENDPOINT}'
-#   region: '${REGION}'
-#   bucket: '${BUCKET}'
-#   prefix_path: '${OSS_PREFIX_PATH}'
-#   signature_version: 's3'
-#   addressing_style: 'virtual'
+oss:
+  access_key: '${ACCESS_KEY}'
+  secret_key: '${SECRET_KEY}'
+  endpoint_url: '${ENDPOINT}'
+  region: '${REGION}'
+  bucket: '${BUCKET}'
+  prefix_path: '${OSS_PREFIX_PATH}'
+  signature_version: 's3'
+  addressing_style: 'virtual'
 # azure:
 #   auth_type: 'sas'
 #   container_url: 'container_url'

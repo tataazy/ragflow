@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import multiprocessing
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -113,20 +114,85 @@ def pip_install_torch():
     subprocess.check_call([sys.executable, "-m", "pip", "install", *pkg_names])
 
 
-def _thread_pool_executor():
-    max_workers_env = os.getenv("THREAD_POOL_MAX_WORKERS", "128")
-    try:
-        max_workers = int(max_workers_env)
-    except ValueError:
-        max_workers = 128
-    if max_workers < 1:
-        max_workers = 1
-    return ThreadPoolExecutor(max_workers=max_workers)
+# 线程池单例
+_thread_pools = {}
+_thread_pool_lock = threading.Lock()
+
+
+def _get_or_create_thread_pool(pool_type="general"):
+    """获取或创建线程池（单例模式）"""
+    global _thread_pools
+    
+    if pool_type not in _thread_pools:
+        with _thread_pool_lock:
+            if pool_type not in _thread_pools:
+                cpu_count = multiprocessing.cpu_count()
+                
+                # 根据环境变量获取最大工作线程数
+                max_workers_env = os.getenv(f"THREAD_POOL_MAX_WORKERS_{pool_type.upper()}", 
+                                          os.getenv("THREAD_POOL_MAX_WORKERS", "128"))
+                
+                try:
+                    max_workers = int(max_workers_env)
+                except ValueError:
+                    # 根据任务类型设置默认线程数
+                    if pool_type == "io_bound":
+                        max_workers = min(cpu_count * 16, 512)  # IO密集型任务使用更多线程
+                    elif pool_type == "cpu_bound":
+                        max_workers = min(cpu_count * 2, 64)  # CPU密集型任务使用较少线程
+                    else:
+                        max_workers = min(cpu_count * 8, 256)  # 通用任务
+                
+                if max_workers < 1:
+                    max_workers = 1
+                
+                # 创建线程池
+                _thread_pools[pool_type] = ThreadPoolExecutor(
+                    max_workers=max_workers, 
+                    thread_name_prefix=f"RAGFlowPool_{pool_type}"
+                )
+                logging.info(f"Created thread pool {pool_type} with {max_workers} workers")
+    
+    return _thread_pools[pool_type]
+
+
+def get_thread_pool_stats():
+    """获取线程池统计信息"""
+    stats = {}
+    for pool_type, pool in _thread_pools.items():
+        stats[pool_type] = {
+            "max_workers": pool._max_workers,
+            "queue_size": pool._work_queue.qsize() if hasattr(pool, "_work_queue") else 0
+        }
+    return stats
+
+
+def shutdown_thread_pools():
+    """关闭所有线程池"""
+    global _thread_pools
+    
+    with _thread_pool_lock:
+        for pool_type, pool in _thread_pools.items():
+            try:
+                pool.shutdown(wait=False)
+                logging.info(f"Shutdown thread pool {pool_type}")
+            except Exception as e:
+                logging.error(f"Error shutting down thread pool {pool_type}: {e}")
+        _thread_pools = {}
 
 
 async def thread_pool_exec(func, *args, **kwargs):
+    """在线程池中执行同步函数"""
     loop = asyncio.get_running_loop()
+    
+    # 确定线程池类型
+    pool_type = kwargs.pop("_pool_type", "general")
+    
+    # 获取线程池
+    pool = _get_or_create_thread_pool(pool_type)
+    
+    # 构建函数调用
     if kwargs:
         func = functools.partial(func, *args, **kwargs)
-        return await loop.run_in_executor(_thread_pool_executor(), func)
-    return await loop.run_in_executor(_thread_pool_executor(), func, *args)
+        return await loop.run_in_executor(pool, func)
+    return await loop.run_in_executor(pool, func, *args)

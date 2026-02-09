@@ -1493,24 +1493,41 @@ async def retrieval_test(tenant_id):
                     format: float
                     description: Similarity score.
     """
+    import time
+    start_time = time.time()
+
     req = await get_request_json()
+
+    # 参数验证
     if not req.get("dataset_ids"):
         return get_error_data_result("`dataset_ids` is required.")
+
     kb_ids = req["dataset_ids"]
     if not isinstance(kb_ids, list):
         return get_error_data_result("`dataset_ids` should be a list")
-    for id in kb_ids:
-        if not KnowledgebaseService.accessible(kb_id=id, user_id=tenant_id):
-            return get_error_data_result(f"You don't own the dataset {id}.")
-    kbs = KnowledgebaseService.get_by_ids(kb_ids)
-    embd_nms = list(set([TenantLLMService.split_model_name_and_factory(kb.embd_id)[0] for kb in kbs]))  # remove vendor suffix for comparison
-    if len(embd_nms) != 1:
-        return get_result(
-            message='Datasets use different embedding models."',
-            code=RetCode.DATA_ERROR,
-        )
+
     if "question" not in req:
         return get_error_data_result("`question` is required.")
+
+    # 批量权限检查
+    inaccessible_kbs = [id for id in kb_ids if not KnowledgebaseService.accessible(kb_id=id, user_id=tenant_id)]
+    if inaccessible_kbs:
+        return get_error_data_result(f"You don't own the datasets: {', '.join(inaccessible_kbs)}.")
+
+    # 批量获取知识库
+    kbs = KnowledgebaseService.get_by_ids(kb_ids)
+    if not kbs:
+        return get_error_data_result("No valid datasets found.")
+
+    # 检查嵌入模型一致性
+    embd_nms = list(set([TenantLLMService.split_model_name_and_factory(kb.embd_id)[0] for kb in kbs]))
+    if len(embd_nms) != 1:
+        return get_result(
+            message='Datasets use different embedding models.',
+            code=RetCode.DATA_ERROR,
+        )
+
+    # 提取参数
     page = int(req.get("page", 1))
     size = int(req.get("page_size", 30))
     question = req["question"]
@@ -1518,14 +1535,26 @@ async def retrieval_test(tenant_id):
     use_kg = req.get("use_kg", False)
     toc_enhance = req.get("toc_enhance", False)
     langs = req.get("cross_languages", [])
+    similarity_threshold = float(req.get("similarity_threshold", 0.2))
+    vector_similarity_weight = float(req.get("vector_similarity_weight", 0.3))
+    top = int(req.get("top_k", 128))
+    highlight = not (req.get("highlight") == "False" or req.get("highlight") == "false")
+
+    # 参数验证阶段
+    param_validate_end = time.time()
+    param_validate_time = param_validate_end - start_time
+
     if not isinstance(doc_ids, list):
-        return get_error_data_result("`documents` should be a list")   
-    if doc_ids: 
+        return get_error_data_result("`documents` should be a list")
+
+    # 文档过滤
+    if doc_ids:
         doc_ids_list = KnowledgebaseService.list_documents_by_ids(kb_ids)
-        for doc_id in doc_ids:
-            if doc_id not in doc_ids_list:
-                return get_error_data_result(f"The datasets don't own the document {doc_id}")
-    if not doc_ids:
+        invalid_doc_ids = [doc_id for doc_id in doc_ids if doc_id not in doc_ids_list]
+        if invalid_doc_ids:
+            return get_error_data_result(f"The datasets don't own the documents: {', '.join(invalid_doc_ids)}")
+    else:
+        # 元数据过滤
         metadata_condition = req.get("metadata_condition")
         if metadata_condition:
             metas = DocumentService.get_meta_by_kbs(kb_ids)
@@ -1533,36 +1562,47 @@ async def retrieval_test(tenant_id):
             # If metadata_condition has conditions but no docs match, return empty result
             if not doc_ids and metadata_condition.get("conditions"):
                 return get_result(data={"total": 0, "chunks": [], "doc_aggs": {}})
-            if metadata_condition and not doc_ids:
+            if not doc_ids:
                 doc_ids = ["-999"]
-        else:
-            # If doc_ids is None all documents of the datasets are used
-            doc_ids = None
-    similarity_threshold = float(req.get("similarity_threshold", 0.2))
-    vector_similarity_weight = float(req.get("vector_similarity_weight", 0.3))
-    top = int(req.get("top_k", 1024))
-    if req.get("highlight") == "False" or req.get("highlight") == "false":
-        highlight = False
-    else:
-        highlight = True
-    try:
-        tenant_ids = list(set([kb.tenant_id for kb in kbs]))
-        e, kb = KnowledgebaseService.get_by_id(kb_ids[0])
-        if not e:
-            return get_error_data_result(message="Dataset not found!")
-        embd_mdl = LLMBundle(kb.tenant_id, LLMType.EMBEDDING, llm_name=kb.embd_id)
 
+    # 文档过滤阶段
+    doc_filter_end = time.time()
+    doc_filter_time = doc_filter_end - param_validate_end
+
+    try:
+        # 提取租户ID
+        tenant_ids = list(set([kb.tenant_id for kb in kbs]))
+
+        # 获取第一个知识库用于模型初始化
+        main_kb = kbs[0]
+
+        # 模型准备
+        embd_mdl = LLMBundle(main_kb.tenant_id, LLMType.EMBEDDING, llm_name=main_kb.embd_id)
+
+        # 获取重排序模型（如果指定）
         rerank_mdl = None
         if req.get("rerank_id"):
-            rerank_mdl = LLMBundle(kb.tenant_id, LLMType.RERANK, llm_name=req["rerank_id"])
+            rerank_mdl = LLMBundle(main_kb.tenant_id, LLMType.RERANK, llm_name=req["rerank_id"])
 
+        # 跨语言处理
         if langs:
-            question = await cross_languages(kb.tenant_id, None, question, langs)
+            question = await cross_languages(main_kb.tenant_id, None, question, langs)
 
+        # 关键词提取
+        chat_mdl = None
         if req.get("keyword", False):
-            chat_mdl = LLMBundle(kb.tenant_id, LLMType.CHAT)
+            chat_mdl = LLMBundle(main_kb.tenant_id, LLMType.CHAT)
             question += await keyword_extraction(chat_mdl, question)
 
+        # 检索参数准备阶段
+        model_prep_end = time.time()
+        model_prep_time = model_prep_end - doc_filter_end
+
+        # 标签提取
+        rank_feature = label_question(question, kbs)
+
+        # 核心检索
+        retrieval_start = time.time()
         ranks = await settings.retriever.retrieval(
             question,
             embd_mdl,
@@ -1576,42 +1616,87 @@ async def retrieval_test(tenant_id):
             doc_ids,
             rerank_mdl=rerank_mdl,
             highlight=highlight,
-            rank_feature=label_question(question, kbs),
+            rank_feature=rank_feature,
         )
+        retrieval_time = time.time() - retrieval_start
+
+        # TOC增强
+        toc_time = 0
         if toc_enhance:
-            chat_mdl = LLMBundle(kb.tenant_id, LLMType.CHAT)
+            toc_start = time.time()
+            if not chat_mdl:
+                chat_mdl = LLMBundle(main_kb.tenant_id, LLMType.CHAT)
             cks = await settings.retriever.retrieval_by_toc(question, ranks["chunks"], tenant_ids, chat_mdl, size)
             if cks:
                 ranks["chunks"] = cks
+            toc_time = time.time() - toc_start
+
+        # 子块合并
+        merge_start = time.time()
         ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], tenant_ids)
+        merge_time = time.time() - merge_start
+
+        # KG检索
+        kg_time = 0
         if use_kg:
-            ck = await settings.kg_retriever.retrieval(question, [k.tenant_id for k in kbs], kb_ids, embd_mdl, LLMBundle(kb.tenant_id, LLMType.CHAT))
+            kg_start = time.time()
+            if not chat_mdl:
+                chat_mdl = LLMBundle(main_kb.tenant_id, LLMType.CHAT)
+            ck = await settings.kg_retriever.retrieval(question, [k.tenant_id for k in kbs], kb_ids, embd_mdl, chat_mdl)
             if ck["content_with_weight"]:
                 ranks["chunks"].insert(0, ck)
+            kg_time = time.time() - kg_start
 
-        for c in ranks["chunks"]:
-            c.pop("vector", None)
+        # 结果处理
+        rename_start = time.time()
 
-        ##rename keys
+        # 移除向量字段并重命名键
+        key_mapping = {
+            "chunk_id": "id",
+            "content_with_weight": "content",
+            "doc_id": "document_id",
+            "important_kwd": "important_keywords",
+            "question_kwd": "questions",
+            "docnm_kwd": "document_keyword",
+            "kb_id": "dataset_id",
+        }
+
         renamed_chunks = []
         for chunk in ranks["chunks"]:
-            key_mapping = {
-                "chunk_id": "id",
-                "content_with_weight": "content",
-                "doc_id": "document_id",
-                "important_kwd": "important_keywords",
-                "question_kwd": "questions",
-                "docnm_kwd": "document_keyword",
-                "kb_id": "dataset_id",
-            }
+            # 移除向量字段
+            chunk.pop("vector", None)
+
+            # 重命名键
             rename_chunk = {}
             for key, value in chunk.items():
                 new_key = key_mapping.get(key, key)
                 rename_chunk[new_key] = value
             renamed_chunks.append(rename_chunk)
+
         ranks["chunks"] = renamed_chunks
+        rename_time = time.time() - rename_start
+
+        # 记录总耗时
+        total_time = time.time() - start_time
+
+        # 记录性能日志（使用结构化日志）
+        logging.info(
+            f"Retrieval performance - "
+            f"tt:{total_time:.3f}s, "
+            f"rt:{retrieval_time:.3f}s, "
+            f"pvt:{param_validate_time:.3f}s, "
+            f"dft:{doc_filter_time:.3f}s, "  
+            f"mpt:{model_prep_time:.3f}s, "
+            f"toct:{toc_time:.3f}s, "
+            f"mt:{merge_time:.3f}s, "
+            f"kt:{kg_time:.3f}s, "
+            f"rt:{rename_time:.3f}s, "
+            f"cc:{len(ranks['chunks'])}"
+        )
+
         return get_result(data=ranks)
     except Exception as e:
+        logging.exception(f"Retrieval error: {e}")
         if str(e).find("not_found") > 0:
             return get_result(
                 message="No chunk found! Check the chunk status please!",

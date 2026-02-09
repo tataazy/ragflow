@@ -1067,7 +1067,7 @@ def hierarchical_merge(bull, sections, depth):
     return res
 
 
-def naive_merge(sections: str | list, chunk_token_num=128, delimiter="\n。；！？", overlapped_percent=0):
+def naive_merge(sections: str | list, chunk_token_num=128, delimiter="\n。；！？", overlapped_percent=0, max_chunk_size=10*1024*1024):
     from deepdoc.parser.pdf_parser import RAGFlowPdfParser
     if not sections:
         return []
@@ -1100,6 +1100,61 @@ def naive_merge(sections: str | list, chunk_token_num=128, delimiter="\n。；�
             cks[-1] += t
             tk_nums[-1] += tnum
 
+    def split_large_chunk(chunk, max_size):
+        """Split a large chunk into smaller ones based on max_size with graceful splitting."""
+        if len(chunk.encode('utf-8')) <= max_size:
+            return [chunk]
+        
+        # List of potential split points in order of priority
+        split_patterns = [
+            r'\n',  # Newline (highest priority)
+            r'[。！？]',  # Chinese sentence endings
+            r'[.!?]\s',  # English sentence endings with space
+            r'[;；]',  # Semicolons
+            r'[,，]',  # Commas
+        ]
+        
+        # Try to split at each pattern level
+        for pattern in split_patterns:
+            parts = re.split(pattern, chunk)
+            if len(parts) > 1:
+                # Reconstruct chunks with delimiters
+                reconstructed = []
+                current = ""
+                for i, part in enumerate(parts):
+                    # Add the part
+                    current += part
+                    # Add the delimiter if it's not the last part
+                    if i < len(parts) - 1:
+                        # Find the delimiter that was matched
+                        match = re.search(pattern, chunk[len(current):])
+                        if match:
+                            current += match.group(0)
+                    
+                    # Check if current chunk is too large
+                    if len(current.encode('utf-8')) > max_size * 0.9:
+                        reconstructed.append(current)
+                        current = ""
+                
+                if current:
+                    reconstructed.append(current)
+                
+                # If we got more than one chunk, return them
+                if len(reconstructed) > 1:
+                    return reconstructed
+        
+        # If no delimiters found, split by max_size directly
+        encoded = chunk.encode('utf-8')
+        chunks = []
+        for i in range(0, len(encoded), max_size):
+            # Find the nearest valid UTF-8 boundary
+            end = min(i + max_size, len(encoded))
+            while end > i and (encoded[end] & 0xC0) == 0x80:
+                end -= 1
+            chunks.append(encoded[i:end].decode('utf-8', errors='ignore'))
+        
+        return chunks
+
     custom_delimiters = [m.group(1) for m in re.finditer(r"`([^`]+)`", delimiter)]
     has_custom = bool(custom_delimiters)
     if has_custom:
@@ -1116,17 +1171,38 @@ def naive_merge(sections: str | list, chunk_token_num=128, delimiter="\n。；�
                     local_pos = ""
                 if local_pos and text.find(local_pos) < 0:
                     text += local_pos
-                cks.append(text)
-                tk_nums.append(num_tokens_from_string(text))
+                # Check if text is too large and split if needed
+                if len(text.encode('utf-8')) > max_chunk_size:
+                    split_texts = split_large_chunk(text, max_chunk_size)
+                    cks.extend(split_texts)
+                    tk_nums.extend([num_tokens_from_string(t) for t in split_texts])
+                else:
+                    cks.append(text)
+                    tk_nums.append(num_tokens_from_string(text))
         return cks
 
     for sec, pos in sections:
-        add_chunk("\n" + sec, pos)
+        text = "\n" + sec
+        # Check if text is too large and split if needed
+        if len(text.encode('utf-8')) > max_chunk_size:
+            split_texts = split_large_chunk(text, max_chunk_size)
+            for split_text in split_texts:
+                add_chunk(split_text, pos)
+        else:
+            add_chunk(text, pos)
 
-    return cks
+    # Final check: split any chunks that are still too large
+    final_cks = []
+    for chunk in cks:
+        if len(chunk.encode('utf-8')) > max_chunk_size:
+            final_cks.extend(split_large_chunk(chunk, max_chunk_size))
+        else:
+            final_cks.append(chunk)
+
+    return final_cks
 
 
-def naive_merge_with_images(texts, images, chunk_token_num=128, delimiter="\n。；！？", overlapped_percent=0):
+def naive_merge_with_images(texts, images, chunk_token_num=128, delimiter="\n。；！？", overlapped_percent=0, max_chunk_size=10*1024*1024):
     from deepdoc.parser.pdf_parser import RAGFlowPdfParser
     if not texts or len(texts) != len(images):
         return [], []
@@ -1161,6 +1237,61 @@ def naive_merge_with_images(texts, images, chunk_token_num=128, delimiter="\n。
                 result_images[-1] = concat_img(result_images[-1], image)
             tk_nums[-1] += tnum
 
+    def split_large_chunk(chunk, max_size):
+        """Split a large chunk into smaller ones based on max_size with graceful splitting."""
+        if len(chunk.encode('utf-8')) <= max_size:
+            return [chunk]
+        
+        # List of potential split points in order of priority
+        split_patterns = [
+            r'\n',  # Newline (highest priority)
+            r'[。！？]',  # Chinese sentence endings
+            r'[.!?]\s',  # English sentence endings with space
+            r'[;；]',  # Semicolons
+            r'[,，]',  # Commas
+        ]
+        
+        # Try to split at each pattern level
+        for pattern in split_patterns:
+            parts = re.split(pattern, chunk)
+            if len(parts) > 1:
+                # Reconstruct chunks with delimiters
+                reconstructed = []
+                current = ""
+                for i, part in enumerate(parts):
+                    # Add the part
+                    current += part
+                    # Add the delimiter if it's not the last part
+                    if i < len(parts) - 1:
+                        # Find the delimiter that was matched
+                        match = re.search(pattern, chunk[len(current):])
+                        if match:
+                            current += match.group(0)
+                    
+                    # Check if current chunk is too large
+                    if len(current.encode('utf-8')) > max_size * 0.9:
+                        reconstructed.append(current)
+                        current = ""
+                
+                if current:
+                    reconstructed.append(current)
+                
+                # If we got more than one chunk, return them
+                if len(reconstructed) > 1:
+                    return reconstructed
+        
+        # If no delimiters found, split by max_size directly
+        encoded = chunk.encode('utf-8')
+        chunks = []
+        for i in range(0, len(encoded), max_size):
+            # Find the nearest valid UTF-8 boundary
+            end = min(i + max_size, len(encoded))
+            while end > i and (encoded[end] & 0xC0) == 0x80:
+                end -= 1
+            chunks.append(encoded[i:end].decode('utf-8', errors='ignore'))
+        
+        return chunks
+
     custom_delimiters = [m.group(1) for m in re.finditer(r"`([^`]+)`", delimiter)]
     has_custom = bool(custom_delimiters)
     if has_custom:
@@ -1179,9 +1310,17 @@ def naive_merge_with_images(texts, images, chunk_token_num=128, delimiter="\n。
                     local_pos = ""
                 if local_pos and text_seg.find(local_pos) < 0:
                     text_seg += local_pos
-                cks.append(text_seg)
-                result_images.append(image)
-                tk_nums.append(num_tokens_from_string(text_seg))
+                # Check if text is too large and split if needed
+                if len(text_seg.encode('utf-8')) > max_chunk_size:
+                    split_texts = split_large_chunk(text_seg, max_chunk_size)
+                    cks.extend(split_texts)
+                    # For images, duplicate the image for each split chunk
+                    result_images.extend([image] * len(split_texts))
+                    tk_nums.extend([num_tokens_from_string(t) for t in split_texts])
+                else:
+                    cks.append(text_seg)
+                    result_images.append(image)
+                    tk_nums.append(num_tokens_from_string(text_seg))
         return cks, result_images
 
     for text, image in zip(texts, images):
@@ -1189,11 +1328,38 @@ def naive_merge_with_images(texts, images, chunk_token_num=128, delimiter="\n。
         if isinstance(text, tuple):
             text_str = text[0]
             text_pos = text[1] if len(text) > 1 else ""
-            add_chunk("\n" + text_str, image, text_pos)
+            text_seg = "\n" + text_str
+            # Check if text is too large and split if needed
+            if len(text_seg.encode('utf-8')) > max_chunk_size:
+                split_texts = split_large_chunk(text_seg, max_chunk_size)
+                for split_text in split_texts:
+                    add_chunk(split_text, image, text_pos)
+            else:
+                add_chunk(text_seg, image, text_pos)
         else:
-            add_chunk("\n" + text, image)
+            text_seg = "\n" + text
+            # Check if text is too large and split if needed
+            if len(text_seg.encode('utf-8')) > max_chunk_size:
+                split_texts = split_large_chunk(text_seg, max_chunk_size)
+                for split_text in split_texts:
+                    add_chunk(split_text, image)
+            else:
+                add_chunk(text_seg, image)
 
-    return cks, result_images
+    # Final check: split any chunks that are still too large
+    final_cks = []
+    final_images = []
+    for chunk, img in zip(cks, result_images):
+        if len(chunk.encode('utf-8')) > max_chunk_size:
+            split_texts = split_large_chunk(chunk, max_chunk_size)
+            final_cks.extend(split_texts)
+            # For images, duplicate the image for each split chunk
+            final_images.extend([img] * len(split_texts))
+        else:
+            final_cks.append(chunk)
+            final_images.append(img)
+
+    return final_cks, final_images
 
 
 def docx_question_level(p, bull=-1):

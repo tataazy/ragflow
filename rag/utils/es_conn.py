@@ -79,6 +79,8 @@ class ESConnection(ESConnectionBase):
 
         s = Search()
         vector_similarity_weight = 0.5
+
+        # 解析融合权重
         for m in match_expressions:
             if isinstance(m, FusionExpr) and m.method == "weighted_sum" and "weights" in m.fusion_params:
                 assert len(match_expressions) == 3 and isinstance(match_expressions[0], MatchTextExpr) and isinstance(
@@ -87,6 +89,8 @@ class ESConnection(ESConnectionBase):
                     match_expressions[2], FusionExpr)
                 weights = m.fusion_params["weights"]
                 vector_similarity_weight = get_float(weights.split(",")[1])
+
+        # 构建查询表达式
         for m in match_expressions:
             if isinstance(m, MatchTextExpr):
                 minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)
@@ -103,13 +107,17 @@ class ESConnection(ESConnectionBase):
                 similarity = 0.0
                 if "similarity" in m.extra_options:
                     similarity = m.extra_options["similarity"]
-                s = s.knn(m.vector_column_name,
-                          m.topn,
-                          m.topn * 2,
-                          query_vector=list(m.embedding_data),
-                          filter=bool_query.to_dict(),
-                          similarity=similarity,
-                          )
+
+                # 优化KNN参数：减少候选数，提高查询速度
+                num_candidates = min(m.topn * 2, 1024)  # 限制最大候选数
+                s = s.knn(
+                    m.vector_column_name,
+                    m.topn,
+                    num_candidates,
+                    query_vector=list(m.embedding_data),
+                    filter=bool_query.to_dict(),
+                    similarity=similarity,
+                )
 
         if bool_query and rank_feature:
             for fld, sc in rank_feature.items():
@@ -119,9 +127,13 @@ class ESConnection(ESConnectionBase):
 
         if bool_query:
             s = s.query(bool_query)
-        for field in highlight_fields:
-            s = s.highlight(field)
 
+        # 只添加需要的高亮字段
+        if highlight_fields:
+            for field in highlight_fields:
+                s = s.highlight(field)
+
+        # 排序
         if order_by:
             orders = list()
             for field, order in order_by.fields:
@@ -135,21 +147,28 @@ class ESConnection(ESConnectionBase):
                     order_info = {"order": order, "unmapped_type": "text"}
                 orders.append({field: order_info})
             s = s.sort(*orders)
+
+        # 聚合
         if agg_fields:
             for fld in agg_fields:
                 s.aggs.bucket(f'aggs_{fld}', 'terms', field=fld, size=1000000)
 
+        # 分页
         if limit > 0:
             s = s[offset:offset + limit]
+
+        # 只返回需要的字段，减少网络传输
+        if select_fields:
+            s = s.source(select_fields)
+
         q = s.to_dict()
         self.logger.debug(f"ESConnection.search {str(index_names)} query: " + json.dumps(q))
 
         for i in range(ATTEMPT_TIME):
             try:
-                # print(json.dumps(q, ensure_ascii=False))
                 res = self.es.search(index=index_names,
                                      body=q,
-                                     timeout="600s",
+                                     timeout="60s",
                                      # search_type="dfs_query_then_fetch",
                                      track_total_hits=True,
                                      _source=True)

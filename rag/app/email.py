@@ -102,6 +102,7 @@ def chunk(
         sections,
         int(parser_config.get("chunk_token_num", 128)),
         parser_config.get("delimiter", "\n!?。；！？"),
+        max_chunk_size=int(parser_config.get("max_chunk_size", 10*1024*1024)),
     )
 
     main_res.extend(tokenize_chunks(chunks, doc, eng, None))

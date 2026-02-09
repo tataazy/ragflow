@@ -119,12 +119,13 @@ FAILED_TASKS = 0
 
 CURRENT_TASKS = {}
 
-MAX_CONCURRENT_TASKS = int(os.environ.get('MAX_CONCURRENT_TASKS', "5"))
-MAX_CONCURRENT_CHUNK_BUILDERS = int(os.environ.get('MAX_CONCURRENT_CHUNK_BUILDERS', "1"))
-MAX_CONCURRENT_MINIO = int(os.environ.get('MAX_CONCURRENT_MINIO', '10'))
+MAX_CONCURRENT_TASKS = int(os.environ.get('MAX_CONCURRENT_TASKS', "10"))
+MAX_CONCURRENT_CHUNK_BUILDERS = int(os.environ.get('MAX_CONCURRENT_CHUNK_BUILDERS', "2"))
+MAX_CONCURRENT_EMBEDDINGS = int(os.environ.get('MAX_CONCURRENT_EMBEDDINGS', "2"))
+MAX_CONCURRENT_MINIO = int(os.environ.get('MAX_CONCURRENT_MINIO', '20'))
 task_limiter = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 chunk_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHUNK_BUILDERS)
-embed_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHUNK_BUILDERS)
+embed_limiter = asyncio.Semaphore(MAX_CONCURRENT_EMBEDDINGS)
 minio_limiter = asyncio.Semaphore(MAX_CONCURRENT_MINIO)
 kg_limiter = asyncio.Semaphore(2)
 WORKER_HEARTBEAT_TIMEOUT = int(os.environ.get('WORKER_HEARTBEAT_TIMEOUT', '120'))
@@ -878,8 +879,14 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
         chunks: List of chunk dictionaries to insert
         progress_callback: Callback function for progress updates
     """
-    mothers = []
+    # Process chunks in batches to reduce memory usage
+    batch_size = settings.DOC_BULK_SIZE
+    total_chunks = len(chunks)
+    
+    # First, process all chunks to add mom_id
     mother_ids = set([])
+    mothers = []
+    
     for ck in chunks:
         mom = ck.get("mom") or ck.get("mom_with_weight") or ""
         if not mom:
@@ -889,59 +896,44 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
         if id in mother_ids:
             continue
         mother_ids.add(id)
-        mom_ck = copy.deepcopy(ck)
-        mom_ck["id"] = id
-        mom_ck["content_with_weight"] = mom
-        mom_ck["available_int"] = 0
-        flds = list(mom_ck.keys())
-        for fld in flds:
-            if fld not in ["id", "content_with_weight", "doc_id", "docnm_kwd", "kb_id", "available_int",
-                           "position_int"]:
-                del mom_ck[fld]
+        # Create minimal mother chunk with only necessary fields
+        mom_ck = {
+            "id": id,
+            "content_with_weight": mom,
+            "doc_id": ck.get("doc_id"),
+            "docnm_kwd": ck.get("docnm_kwd"),
+            "kb_id": ck.get("kb_id"),
+            "available_int": 0,
+            "position_int": ck.get("position_int")
+        }
         mothers.append(mom_ck)
-
-    for b in range(0, len(mothers), settings.DOC_BULK_SIZE):
-        await thread_pool_exec(settings.docStoreConn.insert, mothers[b:b + settings.DOC_BULK_SIZE],
+    
+    # Insert mothers in batches
+    for b in range(0, len(mothers), batch_size):
+        batch_mothers = mothers[b:b + batch_size]
+        await thread_pool_exec(settings.docStoreConn.insert, batch_mothers,
                                 search.index_name(task_tenant_id), task_dataset_id, )
+    
+    # Clear mothers list to free memory
+    del mothers
+    del mother_ids
+    
+    # Insert chunks in batches
+    for b in range(0, total_chunks, batch_size):
+        batch_chunks = chunks[b:b + batch_size]
+        await thread_pool_exec(settings.docStoreConn.insert, batch_chunks,
+                                search.index_name(task_tenant_id), task_dataset_id, )
+        
+        # Update progress
+        if progress_callback:
+            progress = 0.7 + 0.2 * (b + len(batch_chunks)) / total_chunks
+            progress_callback(prog=progress, msg=f"Inserting chunks: {b + len(batch_chunks)}/{total_chunks}")
         task_canceled = has_canceled(task_id)
         if task_canceled:
             progress_callback(-1, msg="Task has been canceled.")
             return False
-
-    for b in range(0, len(chunks), settings.DOC_BULK_SIZE):
-        doc_store_result = await thread_pool_exec(settings.docStoreConn.insert, chunks[b:b + settings.DOC_BULK_SIZE],
-                                                   search.index_name(task_tenant_id), task_dataset_id, )
-        task_canceled = has_canceled(task_id)
-        if task_canceled:
-            progress_callback(-1, msg="Task has been canceled.")
-            return False
-        if b % 128 == 0:
-            progress_callback(prog=0.8 + 0.1 * (b + 1) / len(chunks), msg="")
-        if doc_store_result:
-            error_message = f"Insert chunk error: {doc_store_result}, please check log file and Elasticsearch/Infinity status!"
-            progress_callback(-1, msg=error_message)
-            raise Exception(error_message)
-        chunk_ids = [chunk["id"] for chunk in chunks[:b + settings.DOC_BULK_SIZE]]
-        chunk_ids_str = " ".join(chunk_ids)
-        try:
-            TaskService.update_chunk_ids(task_id, chunk_ids_str)
-        except DoesNotExist:
-            logging.warning(f"do_handle_task update_chunk_ids failed since task {task_id} is unknown.")
-            doc_store_result = await thread_pool_exec(settings.docStoreConn.delete, {"id": chunk_ids},
-                                                       search.index_name(task_tenant_id), task_dataset_id, )
-            tasks = []
-            for chunk_id in chunk_ids:
-                tasks.append(asyncio.create_task(delete_image(task_dataset_id, chunk_id)))
-            try:
-                await asyncio.gather(*tasks, return_exceptions=False)
-            except Exception as e:
-                logging.error(f"delete_image failed: {e}")
-                for t in tasks:
-                    t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
-            progress_callback(-1, msg=f"Chunk updates failed since task {task_id} is unknown.")
-            return False
+    
+    # Return True on success
     return True
 
 
@@ -1200,25 +1192,25 @@ async def handle_task():
                                                              PipelineTaskType.PARSE) or PipelineTaskType.PARSE
     task_id = task["id"]
     try:
-        logging.info(f"handle_task begin for task {json.dumps(task)}")
+        logging.info(f"handle_task begin for task {task['id']}, doc_id: {task['doc_id']}, name: {task['name']}")
         CURRENT_TASKS[task["id"]] = copy.deepcopy(task)
         await do_handle_task(task)
         DONE_TASKS += 1
         CURRENT_TASKS.pop(task_id, None)
-        logging.info(f"handle_task done for task {json.dumps(task)}")
+        logging.info(f"handle_task done for task {task['id']}, doc_id: {task['doc_id']}, name: {task['name']}")
     except Exception as e:
-        FAILED_TASKS += 1
-        CURRENT_TASKS.pop(task_id, None)
-        try:
-            err_msg = str(e)
-            while isinstance(e, exceptiongroup.ExceptionGroup):
-                e = e.exceptions[0]
-                err_msg += ' -- ' + str(e)
-            set_progress(task_id, prog=-1, msg=f"[Exception]: {err_msg}")
-        except Exception as e:
-            logging.exception(f"[Exception]: {str(e)}")
-            pass
-        logging.exception(f"handle_task got exception for task {json.dumps(task)}")
+            FAILED_TASKS += 1
+            CURRENT_TASKS.pop(task_id, None)
+            try:
+                err_msg = str(e)
+                while isinstance(e, exceptiongroup.ExceptionGroup):
+                    e = e.exceptions[0]
+                    err_msg += ' -- ' + str(e)
+                set_progress(task_id, prog=-1, msg=f"[Exception]: {err_msg}")
+            except Exception as e:
+                logging.exception(f"[Exception]: {str(e)}")
+                pass
+            logging.exception(f"handle_task got exception for task {task['id']}, doc_id: {task['doc_id']}, name: {task['name']}")
     finally:
         task_document_ids = []
         if task_type in ["graphrag", "raptor", "mindmap"]:
@@ -1283,7 +1275,15 @@ async def report_status():
         except Exception as e:
             logging.warning(f"Failed to report heartbeat: {e}")
         else:
-            logging.info(f"{CONSUMER_NAME} reported heartbeat: {heartbeat}")
+            # Only log essential heartbeat information to avoid excessive logging
+            heartbeat_info = {
+                "pending": PENDING_TASKS,
+                "lag": LAG_TASKS,
+                "done": DONE_TASKS,
+                "failed": FAILED_TASKS,
+                "current_task_count": len(current)
+            }
+            logging.info(f"{CONSUMER_NAME} reported heartbeat: {heartbeat_info}")
 
         # Clean up own expired heartbeat
         try:

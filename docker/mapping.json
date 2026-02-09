@@ -1,0 +1,231 @@
+{
+  "settings": {
+    "index": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "refresh_interval": "30s",
+      "similarity": {
+        "default": {
+          "type": "BM25"
+        }
+      },
+      "merge.policy.tiered.max_merged_segment": "10gb",
+      "merge.policy.tiered.floor_segment": "1gb",
+      "merge.scheduler.max_thread_count": 4
+    }
+  },
+  "mappings": {
+    "properties": {
+      "lat_lon": {
+        "type": "geo_point",
+        "store": "true"
+      }
+    },
+    "date_detection": "true",
+    "dynamic_templates": [
+      {
+        "int": {
+          "match": "*_int",
+          "mapping": {
+            "type": "integer",
+            "store": "true"
+          }
+        }
+      },
+      {
+        "ulong": {
+          "match": "*_ulong",
+          "mapping": {
+            "type": "unsigned_long",
+            "store": "true"
+          }
+        }
+      },
+      {
+        "long": {
+          "match": "*_long",
+          "mapping": {
+            "type": "long",
+            "store": "true"
+          }
+        }
+      },
+      {
+        "short": {
+          "match": "*_short",
+          "mapping": {
+            "type": "short",
+            "store": "true"
+          }
+        }
+      },
+      {
+        "numeric": {
+          "match": "*_flt",
+          "mapping": {
+            "type": "float",
+            "store": true
+          }
+        }
+      },
+      {
+        "tks": {
+          "match": "*_tks",
+          "mapping": {
+            "type": "text",
+            "analyzer": "whitespace",
+            "store": true
+          }
+        }
+      },
+      {
+        "ltks": {
+          "match": "*_ltks",
+          "mapping": {
+            "type": "text",
+            "analyzer": "whitespace",
+            "store": true
+          }
+        }
+      },
+      {
+        "kwd": {
+          "match_pattern": "regex",
+          "match": "^(.*_(kwd|id|ids|uid|uids)|uid)$",
+          "mapping": {
+            "type": "keyword",
+            "similarity": "boolean",
+            "store": true
+          }
+        }
+      },
+      {
+        "dt": {
+          "match_pattern": "regex",
+          "match": "^.*(_dt|_time|_at)$",
+          "mapping": {
+            "type": "date",
+            "format": "yyyy-MM-dd HH:mm:ss||yyyy-MM-dd||yyyy-MM-dd_HH:mm:ss",
+            "store": true
+          }
+        }
+      },
+      {
+        "nested": {
+          "match": "*_nst",
+          "mapping": {
+            "type": "nested"
+          }
+        }
+      },
+      {
+        "object": {
+          "match": "*_obj",
+          "mapping": {
+            "type": "object",
+            "dynamic": "true"
+          }
+        }
+      },
+      {
+        "string": {
+          "match_pattern": "regex",
+          "match": "^.*_(with_weight|list)$",
+          "mapping": {
+            "type": "text",
+            "index": "false",
+            "store": true
+          }
+        }
+      },
+      {
+        "rank_feature": {
+          "match": "*_fea",
+          "mapping": {
+            "type": "rank_feature"
+          }
+        }
+      },
+      {
+        "rank_features": {
+          "match": "*_feas",
+          "mapping": {
+            "type": "rank_features"
+          }
+        }
+      },
+      {
+        "dense_vector_512": {
+          "match": "*_512_vec",
+          "mapping": {
+            "type": "dense_vector",
+            "index": true,
+            "similarity": "cosine",
+            "dims": 512,
+            "index_options": {
+              "type": "int8_hnsw",
+              "m": 32,
+              "ef_construction": 400
+            }
+          }
+        }
+      },
+      {
+        "dense_vector_768": {
+          "match": "*_768_vec",
+          "mapping": {
+            "type": "dense_vector",
+            "index": true,
+            "similarity": "cosine",
+            "dims": 768,
+            "index_options": {
+              "type": "int8_hnsw",
+              "m": 32,
+              "ef_construction": 400
+            }
+          }
+        }
+      },
+      {
+        "dense_vector_1024": {
+          "match": "*_1024_vec",
+          "mapping": {
+            "type": "dense_vector",
+            "index": true,
+            "similarity": "cosine",
+            "dims": 1024,
+            "index_options": {
+              "type": "int8_hnsw",
+              "m": 32,
+              "ef_construction": 400
+            }
+          }
+        }
+      },
+      {
+        "dense_vector_1536": {
+          "match": "*_1536_vec",
+          "mapping": {
+            "type": "dense_vector",
+            "index": true,
+            "similarity": "cosine",
+            "dims": 1536,
+            "index_options": {
+              "type": "int8_hnsw",
+              "m": 32,
+              "ef_construction": 400
+            }
+          }
+        }
+      },
+      {
+        "binary": {
+          "match": "*_bin",
+          "mapping": {
+            "type": "binary"
+          }
+        }
+      }
+    ]
+  }
+}

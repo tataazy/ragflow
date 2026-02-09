@@ -66,29 +66,51 @@ class RAGFlowExcelParser:
                 raise Exception(f"pandas.read_excel error: {e_pandas}, original openpyxl error: {e}")
 
     @staticmethod
-    def _clean_dataframe(df: pd.DataFrame):
+    def _clean_dataframe(df):
         def clean_string(s):
             if isinstance(s, str):
                 return ILLEGAL_CHARACTERS_RE.sub(" ", s)
             return s
 
-        return df.apply(lambda col: col.map(clean_string))
+        if isinstance(df, dict):
+            # Handle case where df is a dict of DataFrames (multiple sheets)
+            for sheet_name, sheet_df in df.items():
+                if isinstance(sheet_df, pd.DataFrame):
+                    df[sheet_name] = sheet_df.apply(lambda col: col.map(clean_string))
+            return df
+        elif isinstance(df, pd.DataFrame):
+            # Handle case where df is a single DataFrame
+            return df.apply(lambda col: col.map(clean_string))
+        else:
+            # Return as-is if not a DataFrame or dict
+            return df
 
     @staticmethod
     def _dataframe_to_workbook(df):
-        # if contains multiple sheets use _dataframes_to_workbook
-        if isinstance(df, dict) and len(df) > 1:
-            return RAGFlowExcelParser._dataframes_to_workbook(df)
+        # Clean the dataframe first
+        cleaned_df = RAGFlowExcelParser._clean_dataframe(df)
+        
+        # Handle dict case (multiple sheets)
+        if isinstance(cleaned_df, dict):
+            if len(cleaned_df) > 1:
+                return RAGFlowExcelParser._dataframes_to_workbook(cleaned_df)
+            else:
+                # Handle single sheet case
+                sheet_name = next(iter(cleaned_df.keys()))
+                cleaned_df = cleaned_df[sheet_name]
 
-        df = RAGFlowExcelParser._clean_dataframe(df)
+        # Ensure cleaned_df is a DataFrame before accessing columns
+        if not isinstance(cleaned_df, pd.DataFrame):
+            raise Exception(f"Expected DataFrame, got {type(cleaned_df)}")
+
         wb = Workbook()
         ws = wb.active
         ws.title = "Data"
 
-        for col_num, column_name in enumerate(df.columns, 1):
+        for col_num, column_name in enumerate(cleaned_df.columns, 1):
             ws.cell(row=1, column=col_num, value=column_name)
 
-        for row_num, row in enumerate(df.values, 2):
+        for row_num, row in enumerate(cleaned_df.values, 2):
             for col_num, value in enumerate(row, 1):
                 ws.cell(row=row_num, column=col_num, value=value)
 

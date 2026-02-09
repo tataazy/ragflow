@@ -37,6 +37,7 @@ class SplitterParam(ProcessParamBase):
         self.children_delimiters = []
         self.table_context_size = 0
         self.image_context_size = 0
+        self.max_chunk_size = 10 * 1024 * 1024  # 10MB
 
     def check(self):
         self.check_empty(self.delimiters, "Delimiters.")
@@ -44,6 +45,7 @@ class SplitterParam(ProcessParamBase):
         self.check_decimal_float(self.overlapped_percent, "Overlapped percentage: [0, 1)")
         self.check_nonnegative_number(self.table_context_size, "Table context size.")
         self.check_nonnegative_number(self.image_context_size, "Image context size.")
+        self.check_positive_integer(self.max_chunk_size, "Max chunk size.")
 
     def get_input_form(self) -> dict[str, dict]:
         return {}
@@ -86,6 +88,7 @@ class Splitter(ProcessBase):
                 self._param.chunk_token_size,
                 deli,
                 overlapped_percent,
+                max_chunk_size=self._param.max_chunk_size,
             )
             if custom_pattern:
                 docs = []
@@ -127,12 +130,13 @@ class Splitter(ProcessBase):
             section_images.append(id2image(o.get("img_id"), partial(settings.STORAGE_IMPL.get, tenant_id=self._canvas._tenant_id)))
 
         chunks, images = naive_merge_with_images(
-            sections,
-            section_images,
-            self._param.chunk_token_size,
-            deli,
-            overlapped_percent,
-        )
+                sections,
+                section_images,
+                self._param.chunk_token_size,
+                deli,
+                overlapped_percent,
+                max_chunk_size=self._param.max_chunk_size,
+            )
         cks = [
             {
                 "text": RAGFlowPdfParser.remove_tag(c),
