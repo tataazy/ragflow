@@ -27,7 +27,6 @@ from common.doc_store.doc_store_base import MatchExpr, OrderByExpr, MatchTextExp
 from common.doc_store.es_conn_base import ESConnectionBase
 from common.float_utils import get_float
 from common.constants import PAGERANK_FLD, TAG_FLD
-from rag.nlp.rag_tokenizer import tokenize, fine_grained_tokenize
 
 ATTEMPT_TIME = 2
 
@@ -57,6 +56,8 @@ class ESConnection(ESConnectionBase):
         :param message: A dictionary containing message details.
         :return: A dictionary formatted for Elasticsearch/Infinity indexing.
         """
+        # Import here to avoid circular dependency
+        from rag.nlp.rag_tokenizer import tokenize, fine_grained_tokenize
         storage_doc = {
             "id": message.get("id"),
             "message_id": message["message_id"],
@@ -392,6 +393,8 @@ class ESConnection(ESConnectionBase):
         return res
 
     def update(self, condition: dict, new_value: dict, index_name: str, memory_id: str) -> bool:
+        # Import here to avoid circular dependency
+        from rag.nlp.rag_tokenizer import tokenize, fine_grained_tokenize
         doc = copy.deepcopy(new_value)
         update_dict = {self.convert_field_name(k): v for k, v in doc.items()}
         if "content_ltks" in update_dict:

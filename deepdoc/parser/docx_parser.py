@@ -16,18 +16,19 @@
 
 from docx import Document
 import re
+import logging
 import pandas as pd
 from collections import Counter
 from rag.nlp import rag_tokenizer
 from io import BytesIO
+from common.text_quality import is_gibberish, filter_gibberish
 
 
 class RAGFlowDocxParser:
 
     def __extract_table_content(self, tb):
-        df = []
-        for row in tb.rows:
-            df.append([c.text for c in row.cells])
+        # 使用列表推导式，提升性能
+        df = [[c.text for c in row.cells] for row in tb.rows]
         return self.__compose_table_content(pd.DataFrame(df))
 
     def __compose_table_content(self, df):
@@ -133,7 +134,34 @@ class RAGFlowDocxParser:
                 if 'lastRenderedPageBreak' in run._element.xml:
                     pn += 1
 
-            secs.append(("".join(runs_within_single_paragraph), p.style.name if hasattr(p.style, 'name') else '')) # then concat run.text as part of the paragraph
+            text = "".join(runs_within_single_paragraph)
+            style = p.style.name if hasattr(p.style, 'name') else ''
+            
+            # Filter gibberish content
+            if text.strip():
+                if not is_gibberish(text):
+                    filtered_text = filter_gibberish(text)
+                    if filtered_text:
+                        secs.append((filtered_text, style))
+                else:
+                    logging.debug(f"Filtered gibberish paragraph from DOCX: {text[:100]}...")
+            else:
+                secs.append((text, style))
 
-        tbls = [self.__extract_table_content(tb) for tb in self.doc.tables]
+        tbls = []
+        for tb in self.doc.tables:
+            table_content = self.__extract_table_content(tb)
+            if table_content:
+                # Filter gibberish in table content
+                filtered_table_content = []
+                for line in table_content:
+                    if line.strip():
+                        if not is_gibberish(line):
+                            filtered_line = filter_gibberish(line)
+                            if filtered_line:
+                                filtered_table_content.append(filtered_line)
+                        else:
+                            logging.debug(f"Filtered gibberish table line from DOCX: {line[:100]}...")
+                if filtered_table_content:
+                    tbls.append(filtered_table_content)
         return secs, tbls

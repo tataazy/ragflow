@@ -21,7 +21,6 @@ import time
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 
-from rag.prompts.generator import relevant_chunks_with_toc
 from rag.nlp import rag_tokenizer, query
 import numpy as np
 from common.doc_store.doc_store_base import MatchDenseExpr, FusionExpr, OrderByExpr, DocStoreConnection
@@ -853,6 +852,9 @@ class Dealer:
     async def retrieval_by_toc(self, query: str, chunks: list[dict], tenant_ids: list[str], chat_mdl, topn: int = 6):
         if not chunks:
             return []
+        # Import here to avoid circular dependency
+        from rag.prompts.generator import relevant_chunks_with_toc
+        
         idx_nms = [index_name(tid) for tid in tenant_ids]
         ranks, doc_id2kb_id = {}, {}
         for ck in chunks:

@@ -130,21 +130,26 @@ def _get_or_create_thread_pool(pool_type="general"):
                 
                 # 根据环境变量获取最大工作线程数
                 max_workers_env = os.getenv(f"THREAD_POOL_MAX_WORKERS_{pool_type.upper()}", 
-                                          os.getenv("THREAD_POOL_MAX_WORKERS", "128"))
+                                      os.getenv("THREAD_POOL_MAX_WORKERS", "128"))
+                logging.info(f"Thread pool {pool_type} max workers: {max_workers_env}")
                 
                 try:
                     max_workers = int(max_workers_env)
                 except ValueError:
                     # 根据任务类型设置默认线程数
                     if pool_type == "io_bound":
-                        max_workers = min(cpu_count * 16, 512)  # IO密集型任务使用更多线程
+                        max_workers = min(cpu_count * 8, 256)  # IO密集型任务使用更多线程
                     elif pool_type == "cpu_bound":
-                        max_workers = min(cpu_count * 2, 64)  # CPU密集型任务使用较少线程
+                        max_workers = min(cpu_count * 2, 32)   # CPU密集型任务使用较少线程
                     else:
-                        max_workers = min(cpu_count * 8, 256)  # 通用任务
+                        max_workers = min(cpu_count * 4, 128)  # 通用任务
+                
+                # 强制限制最大线程数，避免资源过度消耗
+                max_workers = min(max_workers, 128)
+                logging.info(f"Final thread pool {pool_type} max workers: {max_workers}")
                 
                 if max_workers < 1:
-                    max_workers = 1
+                    max_workers = 32
                 
                 # 创建线程池
                 _thread_pools[pool_type] = ThreadPoolExecutor(

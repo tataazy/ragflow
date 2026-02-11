@@ -26,7 +26,7 @@ from api.db.db_models import LLM
 from api.db.services.common_service import CommonService
 from api.db.services.tenant_llm_service import LLM4Tenant, TenantLLMService
 from common.constants import LLMType
-from common.token_utils import num_tokens_from_string
+from common.token_utils import num_tokens_from_string, truncate
 
 
 class LLMService(CommonService):
@@ -101,7 +101,7 @@ class LLMBundle(LLM4Tenant):
             token_size = num_tokens_from_string(text)
             if token_size > self.max_length:
                 target_len = int(self.max_length * 0.95)
-                safe_texts.append(text[:target_len])
+                safe_texts.append(truncate(text, target_len))
             else:
                 safe_texts.append(text)
 
@@ -121,7 +121,16 @@ class LLMBundle(LLM4Tenant):
         if self.langfuse:
             generation = self.langfuse.start_generation(trace_context=self.trace_context, name="encode_queries", model=self.llm_name, input={"query": query})
 
-        emd, used_tokens = self.mdl.encode_queries(query)
+        # Add token length check and truncation for queries
+        token_size = num_tokens_from_string(query)
+        if token_size > self.max_length:
+            target_len = int(self.max_length * 0.95)
+            safe_query = truncate(query, target_len)
+            logging.warning(f"Query token size ({token_size}) exceeds max length ({self.max_length}), truncated to {target_len} tokens")
+        else:
+            safe_query = query
+
+        emd, used_tokens = self.mdl.encode_queries(safe_query)
         llm_name = getattr(self, "llm_name", None)
         if not TenantLLMService.increase_usage(self.tenant_id, self.llm_type, used_tokens, llm_name):
             logging.error("LLMBundle.encode_queries can't update token usage for <tenant redacted>/EMBEDDING used_tokens: {}".format(used_tokens))
@@ -136,7 +145,27 @@ class LLMBundle(LLM4Tenant):
         if self.langfuse:
             generation = self.langfuse.start_generation(trace_context=self.trace_context, name="similarity", model=self.llm_name, input={"query": query, "texts": texts})
 
-        sim, used_tokens = self.mdl.similarity(query, texts)
+        # Add token length check and truncation for similarity inputs
+        token_size = num_tokens_from_string(query)
+        if token_size > self.max_length:
+            target_len = int(self.max_length * 0.95)
+            safe_query = truncate(query, target_len)
+            logging.warning(f"Query token size ({token_size}) exceeds max length ({self.max_length}), truncated to {target_len} tokens")
+        else:
+            safe_query = query
+
+        # Truncate texts if needed
+        safe_texts = []
+        for text in texts:
+            text_token_size = num_tokens_from_string(text)
+            if text_token_size > self.max_length:
+                target_len = int(self.max_length * 0.95)
+                safe_texts.append(truncate(text, target_len))
+                logging.warning(f"Text token size ({text_token_size}) exceeds max length ({self.max_length}), truncated to {target_len} tokens")
+            else:
+                safe_texts.append(text)
+
+        sim, used_tokens = self.mdl.similarity(safe_query, safe_texts)
         if not TenantLLMService.increase_usage(self.tenant_id, self.llm_type, used_tokens):
             logging.error("LLMBundle.similarity can't update token usage for {}/RERANK used_tokens: {}".format(self.tenant_id, used_tokens))
 
