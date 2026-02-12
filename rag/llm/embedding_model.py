@@ -134,6 +134,8 @@ class LocalAIEmbed(Base):
 
     def encode(self, texts: list):
         batch_size = 16
+        # Truncate texts to avoid token length errors
+        texts = [truncate(t, 8191) for t in texts]
         ress = []
         for i in range(0, len(texts), batch_size):
             res = self.client.embeddings.create(input=texts[i : i + batch_size], model=self.model_name)
@@ -146,6 +148,8 @@ class LocalAIEmbed(Base):
         return np.array(ress), 1024
 
     def encode_queries(self, text):
+        # Truncate text to avoid token length errors
+        text = truncate(text, 8191)
         embds, cnt = self.encode([text])
         return np.array(embds[0]), cnt
 
@@ -642,21 +646,54 @@ class OpenAI_APIEmbed(OpenAIEmbed):
         self.model_name = model_name.split("___")[0]
 
     def encode(self, texts: list):
-        # OpenAI requires batch size <=16
-        batch_size = 16
-        # 确保每个输入都被截断到模型的最大 token 限制
-        texts = [truncate(t, 8191) for t in texts]
+        max_tokens = 8192  # bge-m3 限制
+
+        # 简单估算：1 token ≈ 4 字符（保守可按 1 token ≈ 2 字符）
+        def estimate_tokens(text):
+            return len(text) // 2  # 保守估算，中文约占 2 字符/token
+
+        # 或者更保险：直接按字符数 = token 数（肯定不会超）
+        # def estimate_tokens(text):
+        #     return len(text)
+
         ress = []
         total_tokens = 0
-        for i in range(0, len(texts), batch_size):
-            res = self.client.embeddings.create(input=texts[i : i + batch_size], model=self.model_name, encoding_format="float")
-            try:
-                ress.extend([d.embedding for d in res.data])
-                total_tokens += total_token_count_from_response(res)
-            except Exception as _e:
-                log_exception(_e, res)
-                raise Exception(f"Error: {res}")
+        i = 0
+
+        while i < len(texts):
+            batch = []
+            batch_tokens = 0
+
+            while i < len(texts):
+                text = texts[i]
+                text_tokens = estimate_tokens(text)
+
+                # 单条截断
+                if text_tokens > max_tokens:
+                    # 按字符比例截断
+                    keep_chars = max_tokens * 2  # 对应上面的 //2
+                    text = text[:keep_chars]
+                    text_tokens = max_tokens
+
+                # 批量已满，发送请求
+                if batch_tokens + text_tokens > max_tokens and batch:
+                    break
+
+                batch.append(text)
+                batch_tokens += text_tokens
+                i += 1
+
+            # 发送本批次
+            res = self.client.embeddings.create(
+                input=batch,
+                model=self.model_name,
+                encoding_format="float"
+            )
+            ress.extend([d.embedding for d in res.data])
+            total_tokens += total_token_count_from_response(res)
+
         return np.array(ress), total_tokens
+
 
 
 class CoHereEmbed(Base):

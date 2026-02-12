@@ -83,49 +83,86 @@ def _is_pseudo_english_gibberish(text):
 
 def is_gibberish(text, threshold=0.3):
     """
-    检测文本是否为乱码
-    
+    检测文本是否为乱码（性能优化版）
+
     Args:
         text: 待检测文本
         threshold: 乱码阈值，超过此值认为是乱码
-        
+
     Returns:
         bool: 是否为乱码
     """
-    if not text or not text.strip():
+    if not text or len(text) < 10:
         return False
-    
-    # 首先检测"伪英文乱码"（看起来像英文但实际是随机字符）
+
+    # 快速路径：纯中文文本
+    if re.match(r'^[\u4e00-\u9fa5\s]+$', text):
+        return False
+
+    # 检测CID占位符
+    cid_matches = re.findall(r'\(cid:\d+\)', text)
+    if len(cid_matches) > 0:
+        cid_ratio = sum(len(m) for m in cid_matches) / len(text)
+        if cid_ratio > 0.01:  # 超过1%的CID占位符
+            logging.debug(f"Detected CID placeholders: {cid_ratio:.2%}")
+            return True
+
+    # 检测伪英文乱码
     if _is_pseudo_english_gibberish(text):
         logging.debug(f"Detected pseudo-English gibberish: {text[:100]}...")
         return True
-    
-    # 1. 检测非ASCII字符比例（针对英文文档）
-    ascii_chars = sum(1 for c in text if ord(c) < 128)
-    total_chars = len(text)
-    non_ascii_ratio = (total_chars - ascii_chars) / total_chars if total_chars > 0 else 0
-    
-    # 2. 检测控制字符比例
-    control_chars = sum(1 for c in text if ord(c) < 32 and c not in '\t\n\r')
-    control_ratio = control_chars / total_chars if total_chars > 0 else 0
-    
-    # 3. 检测重复字符比例
-    if total_chars > 0:
-        char_counts = Counter(text)
-        most_common_char, count = char_counts.most_common(1)[0]
-        repeat_ratio = count / total_chars
-    else:
-        repeat_ratio = 0
-    
-    # 4. 检测无意义字符组合（例如连续的特殊字符）
+
+    # 单次遍历统计
+    total = len(text)
+    ascii_count = 0
+    control_count = 0
+    char_counter = Counter()
+
+    for c in text:
+        code = ord(c)
+        if code < 128:
+            ascii_count += 1
+        if code < 32 and c not in '\t\n\r':
+            control_count += 1
+        char_counter[c] += 1
+
+    # 快速失败：控制字符过多
+    if control_count / total > 0.1:
+        return True
+
+    # 重复字符检查
+    most_common = char_counter.most_common(1)[0][1]
+    if most_common / total > 0.5:
+        return True
+
+    # 特殊字符检查（增强版）
     special_chars = re.findall(r'[!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?`~]{3,}', text)
-    special_ratio = sum(len(s) for s in special_chars) / total_chars if total_chars > 0 else 0
+    special_ratio = sum(len(s) for s in special_chars) / total if total > 0 else 0
     
-    # 5. 综合评分
-    gibberish_score = max(non_ascii_ratio, control_ratio, repeat_ratio, special_ratio)
+    # 检测异常Unicode字符
+    unusual_unicode_chars = [0x22, 0x15, 0x6a, 0x9, 0x3f, 0xed, 0x77, 0x38, 0x201c, 0x201d,
+                            0x2018, 0x2019, 0x2026, 0x2014, 0x2013, 0x141, 0x144, 0x14c, 0x157]
+    unusual_unicode_count = sum(1 for c in text if ord(c) in unusual_unicode_chars)
+    unusual_unicode_ratio = unusual_unicode_count / total if total > 0 else 0
     
-    logging.debug(f"Text quality analysis: non_ascii={non_ascii_ratio:.2f}, control={control_ratio:.2f}, repeat={repeat_ratio:.2f}, special={special_ratio:.2f}, score={gibberish_score:.2f}")
-    
+    if unusual_unicode_ratio > 0.15:
+        logging.debug(f"Detected unusual Unicode characters: {unusual_unicode_ratio:.2%}")
+        return True
+
+    # 综合评分（排除中文干扰）
+    chinese_count = len(re.findall(r'[\u4e00-\u9fa5]', text))
+    non_chinese_total = total - chinese_count
+
+    if non_chinese_total == 0:
+        return False
+
+    non_ascii_in_non_chinese = sum(1 for c in text if ord(c) >= 128 and not '\u4e00' <= c <= '\u9fa5')
+    non_ascii_ratio = non_ascii_in_non_chinese / non_chinese_total
+
+    gibberish_score = max(non_ascii_ratio, control_count / total, special_ratio, unusual_unicode_ratio)
+
+    logging.debug(f"Text quality analysis: non_ascii={non_ascii_ratio:.2f}, control={control_count/total:.2f}, special={special_ratio:.2f}, unusual_unicode={unusual_unicode_ratio:.2f}, score={gibberish_score:.2f}")
+
     return gibberish_score > threshold
 
 

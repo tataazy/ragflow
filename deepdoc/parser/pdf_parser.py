@@ -34,10 +34,12 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 from pypdf import PdfReader as pdf2_read
 from sklearn.cluster import KMeans
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import silhouette_score
 
 from common.file_utils import get_project_base_directory
 from common.misc_utils import pip_install_torch
+from common.text_quality import is_gibberish, filter_gibberish
 from deepdoc.vision import OCR, AscendLayoutRecognizer, LayoutRecognizer, Recognizer, TableStructureRecognizer
 from rag.nlp import rag_tokenizer
 from rag.prompts.generator import vision_llm_describe_prompt
@@ -618,7 +620,7 @@ class RAGFlowPdfParser:
             if not b["chars"]:
                 del b["chars"]
                 continue
-            m_ht = np.mean([c["height"] for c in b["chars"]])
+            m_ht = np.mean([c["height"] for c in b["chars"]]) if b["chars"] else 0
             for c in Recognizer.sort_Y_firstly(b["chars"], m_ht):
                 if c["text"] == " " and b["text"]:
                     if re.match(r"[0-9a-zA-Zа-яА-Я,.?;:!%%]", b["text"][-1]):
@@ -687,32 +689,43 @@ class RAGFlowPdfParser:
                     x0s.append([x])
             x0s = np.array(x0s, dtype=float)
 
-            max_try = min(4, len(bxs))
+            # 检查唯一值数量，避免 KMeans 警告
+            n_unique = len(np.unique(x0s))
+            max_try = min(4, len(bxs), max(1, n_unique))
             if max_try < 2:
-                max_try = 1
+                page_cols[pg] = 1
+                continue
+
             best_k = 1
             best_score = -1
 
-            for k in range(1, max_try + 1):
-                km = KMeans(n_clusters=k, n_init="auto")
-                labels = km.fit_predict(x0s)
+            # 抑制 sklearn 收敛警告
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ConvergenceWarning)
+                for k in range(2, max_try + 1):
+                    # 如果唯一值少于 k，跳过
+                    if n_unique < k:
+                        break
+                    km = KMeans(n_clusters=k, n_init="auto")
+                    labels = km.fit_predict(x0s)
 
-                centers = np.sort(km.cluster_centers_.flatten())
-                if len(centers) > 1:
-                    try:
-                        score = silhouette_score(x0s, labels)
-                    except ValueError:
-                        continue
-                else:
-                    score = 0
-                if score > best_score:
-                    best_score = score
-                    best_k = k
+                    centers = np.sort(km.cluster_centers_.flatten())
+                    if len(centers) > 1:
+                        try:
+                            score = silhouette_score(x0s, labels)
+                        except ValueError:
+                            continue
+                    else:
+                        score = 0
+                    if score > best_score:
+                        best_score = score
+                        best_k = k
 
             page_cols[pg] = best_k
-            logging.info(f"[Page {pg}] best_score={best_score:.2f}, best_k={best_k}")
+            logging.info(f"[Page {pg}] best_score={best_score:.2f}, best_k={best_k}, unique_x0={n_unique}")
 
-        global_cols = Counter(page_cols.values()).most_common(1)[0][0]
+        global_cols = Counter(page_cols.values()).most_common(1)[0][0] if page_cols else 1
         logging.info(f"Global column_num decided by majority: {global_cols}")
 
         for pg, bxs in by_page.items():
@@ -857,6 +870,115 @@ class RAGFlowPdfParser:
 
         # self.boxes = sorted(merged_boxes, key=lambda x: (x["page_number"], x.get("col_id", 0), x["top"]))
         self.boxes = merged_boxes
+
+    def _filter_gibberish_boxes(self, min_length=5):
+        """
+        过滤乱码文本框并清理文本内容（增强版）
+        """
+        if not self.boxes:
+            return
+
+        def has_cid_or_garbage(text):
+            """检测 CID 占位符和字符级乱码"""
+            if not text:
+                return False
+
+            # 1. 检测 CID 占位符 (cid:XXX)
+            cid_matches = re.findall(r'\(cid:\d+\)', text)
+            cid_count = len(cid_matches)
+            cid_ratio = sum(len(m) for m in cid_matches) / len(text) if text else 0
+            # 只要包含CID占位符就认为是乱码(更严格的检测)
+            if cid_count > 0 and cid_ratio > 0.01:  # 超过 1% 的 CID 占位符
+                return True
+
+            # 2. 检测私有区 Unicode 字符（字体缺失的乱码）
+            private_use_count = 0
+            unusual_count = 0
+            valid_ranges = [
+                (0x0020, 0x007E),   # ASCII
+                (0x4E00, 0x9FA5),   # 中文
+                (0x3000, 0x303F),   # 中文标点
+                (0xFF00, 0xFFEF),   # 全角字符
+                (0x2000, 0x206F),   # 通用标点
+            ]
+
+            for c in text:
+                code = ord(c)
+                # 检查是否在有效范围内
+                is_valid = any(start <= code <= end for start, end in valid_ranges)
+                if not is_valid:
+                    # 私有区字符（PUA）
+                    if (0xE000 <= code <= 0xF8FF) or code == 0xFFFD:
+                        private_use_count += 1
+                    # 其他不常见字符
+                    elif code > 127:
+                        unusual_count += 1
+
+            garbage_ratio = (private_use_count * 2 + unusual_count) / len(text) if text else 0
+            if garbage_ratio > 0.15:  # 降低阈值到 15% 的异常字符(更严格)
+                return True
+            
+            # 4. 检测文本中特殊符号的密度
+            special_unicode_count = sum(1 for c in text if ord(c) in [
+                0x22, 0x15, 0x6a, 0x9, 0x3f, 0xed, 0x77, 0x38, 0x201c, 0x201d, 
+                0x2018, 0x2019, 0x2026, 0x2014, 0x2013  # 常见的异常Unicode字符
+            ])
+            if special_unicode_count > len(text) * 0.1:  # 超过10%的特殊符号
+                return True
+
+            return False
+
+        def clean_garbage_chars(text):
+            """清理 CID 和乱码字符"""
+            if not text:
+                return text
+
+            # 移除 CID 占位符
+            text = re.sub(r'\(cid:\d+\)', '', text)
+
+            # 移除或替换私有区字符
+            cleaned = []
+            for c in text:
+                code = ord(c)
+                # 跳过私有区和替换字符
+                if (0xE000 <= code <= 0xF8FF) or code == 0xFFFD or code == 0xEFBFBD:
+                    continue
+                # 替换一些常见的乱码字符为空格
+                elif 0x0080 <= code <= 0x009F:  # C1 控制字符
+                    cleaned.append(' ')
+                else:
+                    cleaned.append(c)
+
+            return ''.join(cleaned)
+
+        filtered = []
+        removed_count = 0
+
+        for b in self.boxes:
+            text = b.get("text", "")
+            if not text:
+                removed_count += 1
+                continue
+
+            # 直接检测 CID 和字符级乱码
+            if has_cid_or_garbage(text):
+                logging.debug(f"Remove CID/garbage box: {text[:80]}...")
+                removed_count += 1
+                continue
+
+            # 清理文本
+            cleaned = clean_garbage_chars(text)
+            cleaned = filter_gibberish(cleaned, min_length=min_length)
+
+            if cleaned.strip() and len(cleaned.strip()) >= min_length:
+                b["text"] = cleaned.strip()
+                filtered.append(b)
+            else:
+                removed_count += 1
+
+        self.boxes = filtered
+        logging.info(f"Gibberish filter: {len(self.boxes)} boxes retained, {removed_count} removed")
+
 
     def _final_reading_order_merge(self, zoomin=3):
         if not self.boxes:
@@ -1359,7 +1481,7 @@ class RAGFlowPdfParser:
             except Exception:
                 pass
             boxes.pop(0)
-            mw = np.mean(widths)
+            mw = np.mean(widths) if widths else 0
             if mj or mw / pw >= 0.35 or mw > 200:
                 res.append("\n".join([c["text"] + self._line_tag(c, ZM) for c in lines]))
             else:
@@ -1541,6 +1663,8 @@ class RAGFlowPdfParser:
         self._text_merge()
         self._concat_downward()
         self._filter_forpages()
+        # 新增：过滤乱码
+        self._filter_gibberish_boxes(min_length=5)
         tbls = self._extract_table_figure(need_image, zoomin, return_html, False)
         return self.__filterout_scraps(deepcopy(self.boxes), zoomin), tbls
 
@@ -1567,6 +1691,8 @@ class RAGFlowPdfParser:
         self._text_merge()
         self._concat_downward()
         self._naive_vertical_merge(zoomin)
+        # 新增：过滤乱码
+        self._filter_gibberish_boxes(min_length=5)
         if callback:
             callback(0.92, "Text merged ({:.2f}s)".format(timer() - start))
 

@@ -15,6 +15,7 @@ import logging
 import re
 import sys
 from io import BytesIO
+from timeit import default_timer as timer
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -148,7 +149,16 @@ class RAGFlowExcelParser:
         for img in images:
             try:
                 img_bytes = img._data()
+                # 限制图片大小，避免处理过大的图片
+                if len(img_bytes) > 10 * 1024 * 1024:  # 10MB
+                    logging.warning(f"Image too large ({len(img_bytes)/1024/1024:.2f}MB), skipping")
+                    continue
                 pil_img = Image.open(BytesIO(img_bytes)).convert("RGB")
+
+                # 调整图片大小，减少内存使用
+                max_size = 1536
+                if pil_img.width > max_size or pil_img.height > max_size:
+                    pil_img.thumbnail((max_size, max_size), Image.Resampling.BILINEAR)
 
                 anchor = img.anchor
                 if hasattr(anchor, "_from") and hasattr(anchor, "_to"):
@@ -174,7 +184,8 @@ class RAGFlowExcelParser:
                     "span_type": span,
                 }
                 raw_items.append(item)
-            except Exception:
+            except Exception as e:
+                logging.warning(f"Error extracting image: {e}")
                 continue
         return raw_items
 
@@ -190,38 +201,60 @@ class RAGFlowExcelParser:
                 return ""
             return str(v).strip()
 
+        MAX_COLS = 100
+        CONSECUTIVE_EMPTY = 100  # 连续空行阈值
+
         for sheetname in wb.sheetnames:
             ws = wb[sheetname]
-            try:
-                rows = list(ws.rows)
-            except Exception as e:
-                logging.warning(f"Skip sheet '{sheetname}' due to rows access error: {e}")
+
+            # 获取表头（第一行）
+            header_row = None
+            for row in ws.iter_rows(min_row=1, max_row=1, max_col=MAX_COLS, values_only=True):
+                header_row = row
+                break
+
+            if not header_row or not any(header_row):
                 continue
 
-            if not rows:
-                continue
+            # 生成表头 HTML
+            tb_rows_0 = "<tr>" + "".join(f"<th>{escape(_fmt(v))}</th>" for v in header_row) + "</tr>"
 
-            tb_rows_0 = "<tr>"
-            for t in list(rows[0]):
-                tb_rows_0 += f"<th>{escape(_fmt(t.value))}</th>"
-            tb_rows_0 += "</tr>"
+            # 流式读取数据行
+            current_chunk_rows = []
+            consecutive_empty = 0
+            total_rows = 0
 
-            for chunk_i in range((len(rows) - 1) // chunk_rows + 1):
-                tb = ""
-                tb += f"<table><caption>{sheetname}</caption>"
-                tb += tb_rows_0
-                for r in list(rows[1 + chunk_i * chunk_rows : min(1 + (chunk_i + 1) * chunk_rows, len(rows))]):
-                    tb += "<tr>"
-                    for i, c in enumerate(r):
-                        if c.value is None:
-                            tb += "<td></td>"
-                        else:
-                            tb += f"<td>{escape(_fmt(c.value))}</td>"
-                    tb += "</tr>"
-                tb += "</table>\n"
+            for row in ws.iter_rows(min_row=2, max_col=MAX_COLS, values_only=True):
+                # 空行检查
+                if not any(cell for cell in row if cell):
+                    consecutive_empty += 1
+                    if consecutive_empty >= CONSECUTIVE_EMPTY:
+                        break  # 连续100行空，结束
+                    continue
+                else:
+                    consecutive_empty = 0
+
+                # 格式化为 HTML 行
+                row_html = "<tr>" + "".join(
+                    "<td></td>" if v is None else f"<td>{escape(_fmt(v))}</td>"
+                    for v in row
+                ) + "</tr>"
+                current_chunk_rows.append(row_html)
+                total_rows += 1
+
+                # 达到 chunk 大小，生成一个 table
+                if len(current_chunk_rows) >= chunk_rows:
+                    tb = f'<table><caption>{escape(sheetname)}</caption>{tb_rows_0}{"".join(current_chunk_rows)}</table>\n'
+                    tb_chunks.append(tb)
+                    current_chunk_rows = []
+
+            # 处理剩余的 rows
+            if current_chunk_rows:
+                tb = f'<table><caption>{escape(sheetname)}</caption>{tb_rows_0}{"".join(current_chunk_rows)}</table>\n'
                 tb_chunks.append(tb)
 
         return tb_chunks
+
 
     def markdown(self, fnm):
         import pandas as pd
@@ -238,33 +271,125 @@ class RAGFlowExcelParser:
         return df.to_markdown(index=False)
 
     def __call__(self, fnm):
-        file_like_object = BytesIO(fnm) if not isinstance(fnm, str) else fnm
-        wb = RAGFlowExcelParser._load_excel_to_workbook(file_like_object)
+        file_obj = BytesIO(fnm) if not isinstance(fnm, str) else fnm
+
+        # 优先尝试普通模式（小文件更快）
+        try:
+            st = timer()
+            wb = RAGFlowExcelParser._load_excel_to_workbook(file_obj)
+            logging.info(f"Excel workbook loaded in {timer() - st:.2f}s")
+            logging.info(f"Number of sheets: {len(wb.sheetnames)}")
+
+            # 快速检测：估算总单元格数
+            total_cells = 0
+            CELL_THRESHOLD = 100000  # 5万单元格阈值
+
+            for sheet in wb.worksheets:
+                # 用 dimensions 快速估算，不实际遍历
+                total_cells += sheet.max_row * sheet.max_column
+                if total_cells > CELL_THRESHOLD:
+                    break
+
+            logging.info(f"Number of total_cells: {total_cells}")
+            # 小文件：普通模式（快）
+            if total_cells <= CELL_THRESHOLD:
+                return self._parse_normal(wb)
+            else:
+                # 大文件或异常：流式模式
+                return self._parse_streaming(file_obj)
+
+        except Exception:
+            pass
+
+
+    def _parse_normal(self, wb):
+        """小文件快速模式"""
+        res = []
+        MAX_COLS = 100
+        CONSECUTIVE_EMPTY = 100  # 连续空行阈值
+        st = timer()
+        for sheetname in wb.sheetnames:
+            logging.info(f"_parse_normal sheet: {sheetname}")
+            ws = wb[sheetname]
+            # 限制列数，但行数不限（最多到 ws.max_row）
+            max_col = min(ws.max_column, MAX_COLS)
+
+            rows = []
+            consecutive_empty = 0
+
+            # 遍历所有行，直到连续空行阈值或实际最大行
+            for row in ws.iter_rows(min_row=1, max_col=max_col, values_only=True):
+                if any(cell for cell in row if cell):
+                    rows.append(row)
+                    consecutive_empty = 0
+                else:
+                    consecutive_empty += 1
+                    if consecutive_empty >= CONSECUTIVE_EMPTY:
+                        break  # 连续100行空，结束当前sheet
+
+            if len(rows) < 2:
+                continue
+
+            header, *data = rows
+            for row in data:
+                line = self._format_row(header, row, ws.title)
+                if line:
+                    res.append(line)
+        logging.info(f"_parse_normal Parsed in {timer() - st:.2f}s")
+        logging.info(f"_parse_normal Total rows processed: {len(res)}")
+        return res
+
+
+    def _parse_streaming(self, file_obj):
+        """大文件流式模式（极低内存）"""
+        file_obj.seek(0)
+        wb = load_workbook(file_obj, read_only=True, data_only=True)
 
         res = []
+        CONSECUTIVE_EMPTY = 100
+        st = timer()
         for sheetname in wb.sheetnames:
+            logging.info(f"_parse_streaming sheet: {sheetname}")
             ws = wb[sheetname]
+            row_iter = ws.iter_rows(values_only=True)
+
             try:
-                rows = list(ws.rows)
-            except Exception as e:
-                logging.warning(f"Skip sheet '{sheetname}' due to rows access error: {e}")
+                header = next(row_iter)
+            except StopIteration:
                 continue
-            if not rows:
-                continue
-            ti = list(rows[0])
-            for r in list(rows[1:]):
-                fields = []
-                for i, c in enumerate(r):
-                    if not c.value:
-                        continue
-                    t = str(ti[i].value) if i < len(ti) else ""
-                    t += ("：" if t else "") + str(c.value)
-                    fields.append(t)
-                line = "; ".join(fields)
-                if sheetname.lower().find("sheet") < 0:
-                    line += " ——" + sheetname
-                res.append(line)
+
+            consecutive_empty = 0
+
+            for row in row_iter:
+                if any(cell for cell in row if cell):
+                    line = self._format_row(header, row, ws.title)
+                    if line:
+                        res.append(line)
+                    consecutive_empty = 0
+                else:
+                    consecutive_empty += 1
+                    if consecutive_empty >= CONSECUTIVE_EMPTY:
+                        break  # 连续100行空，结束当前sheet
+        logging.info(f"_parse_streaming Parsed in {timer() - st:.2f}s")
+        logging.info(f"_parse_streaming Total rows processed: {len(res)}")
         return res
+
+
+
+    def _format_row(self, header, row, sheet_name):
+        """统一格式化"""
+        fields = []
+        for i, cell in enumerate(row):
+            if not cell:
+                continue
+            h = str(header[i]) if i < len(header) and header[i] else ""
+            fields.append(f"{h}：" + str(cell) if h else str(cell))
+
+        line = "; ".join(fields)
+        if sheet_name.lower().find("sheet") < 0:
+            line += " ——" + sheet_name
+        return line
+
 
     @staticmethod
     def row_number(fnm, binary):
@@ -275,7 +400,25 @@ class RAGFlowExcelParser:
             for sheetname in wb.sheetnames:
                 try:
                     ws = wb[sheetname]
-                    total += len(list(ws.rows))
+                    # 快速估算：优先用 max_row，但做简单校验
+                    estimated = ws.max_row
+
+                    # 如果估算值过大（>10000），抽样检查实际有效行
+                    if estimated > 10000:
+                        actual = 0
+                        empty_streak = 0
+                        for row in ws.iter_rows(values_only=True):
+                            if any(cell for cell in row if cell):
+                                actual += 1
+                                empty_streak = 0
+                            else:
+                                empty_streak += 1
+                                if empty_streak >= 100:
+                                    break  # 连续100行空，停止
+                        total += actual
+                    else:
+                        total += estimated
+
                 except Exception as e:
                     logging.warning(f"Skip sheet '{sheetname}' due to rows access error: {e}")
                     continue

@@ -14,7 +14,8 @@
 #  limitations under the License.
 
 import time
-
+import gc
+import psutil
 
 from common.misc_utils import thread_pool_exec
 
@@ -130,6 +131,24 @@ minio_limiter = asyncio.Semaphore(MAX_CONCURRENT_MINIO)
 kg_limiter = asyncio.Semaphore(2)
 WORKER_HEARTBEAT_TIMEOUT = int(os.environ.get('WORKER_HEARTBEAT_TIMEOUT', '120'))
 stop_event = threading.Event()
+
+def check_memory_usage():
+    """检查内存使用情况，超过阈值时自动退出"""
+    process = psutil.Process()
+    memory_usage = process.memory_info().rss / 1024 / 1024 / 1024  # GB
+    logging.info(f"Current memory usage: {memory_usage:.2f} GB")
+    # 设置内存使用阈值，超过阈值时自动退出
+    memory_threshold = 40  # 12GB threshold
+    if memory_usage > memory_threshold:
+        logging.error(f"Memory usage too high: {memory_usage:.2f} GB, exiting...")
+        # 清理资源
+        gc.collect()
+        # 再次检查内存使用
+        memory_usage_after_gc = process.memory_info().rss / 1024 / 1024 / 1024
+        logging.info(f"Memory usage after GC: {memory_usage_after_gc:.2f} GB")
+        if memory_usage_after_gc > memory_threshold:
+            logging.error(f"Memory usage still too high after GC: {memory_usage_after_gc:.2f} GB, exiting...")
+            sys.exit(1)
 
 
 def signal_handler(sig, frame):
@@ -1096,16 +1115,29 @@ async def do_handle_task(task):
         return
     else:
         # Standard chunking methods
+        # Check memory usage before processing
+        process = psutil.Process()
+        memory_before = process.memory_info().rss / 1024 / 1024 / 1024
+        logging.info(f"Memory usage before processing {task_document_name}: {memory_before:.2f} GB")
+
         start_ts = timer()
         chunks = await build_chunks(task, progress_callback)
-        logging.info("Build document {}: {:.2f}s".format(task_document_name, timer() - start_ts))
+        memory_after_build = process.memory_info().rss / 1024 / 1024 / 1024
+        logging.info(f"Build document {task_document_name}: {timer() - start_ts:.2f}s, memory change: {memory_after_build - memory_before:.2f} GB")
+        #logging.info("Build document {}: {:.2f}s".format(task_document_name, timer() - start_ts))
         if not chunks:
             progress_callback(1., msg=f"No chunk built from {task_document_name}")
             return
         progress_callback(msg="Generate {} chunks".format(len(chunks)))
+
+        # Check memory usage before embedding
+        memory_before_embed = process.memory_info().rss / 1024 / 1024 / 1024
+        logging.info(f"Memory usage before embedding: {memory_before_embed:.2f} GB")
         start_ts = timer()
         try:
             token_count, vector_size = await embedding(chunks, embedding_model, task_parser_config, progress_callback)
+            memory_after_embed = process.memory_info().rss / 1024 / 1024 / 1024
+            logging.info(f"Embedding chunks: {timer() - start_ts:.2f}s, memory change: {memory_after_embed - memory_before_embed:.2f} GB")
         except Exception as e:
             error_message = "Generate embedding error:{}".format(str(e))
             progress_callback(-1, error_message)
@@ -1202,10 +1234,18 @@ async def handle_task():
         FAILED_TASKS += 1
         CURRENT_TASKS.pop(task_id, None)
         try:
+            # Get detailed error information
+            import traceback
+            err_traceback = traceback.format_exc()
             err_msg = str(e)
             while isinstance(e, exceptiongroup.ExceptionGroup):
                 e = e.exceptions[0]
                 err_msg += ' -- ' + str(e)
+            # Check memory usage when a task fails
+            check_memory_usage()
+            # Log detailed error information
+            logging.error(f"handle_task detailed exception for task {task['id']}, doc_id: {task['doc_id']}, name: {task['name']}:\n{err_traceback}")
+            # Update task progress with error information
             set_progress(task_id, prog=-1, msg=f"[Exception]: {err_msg}")
         except Exception as e:
             logging.exception(f"[Exception]: {str(e)}")
