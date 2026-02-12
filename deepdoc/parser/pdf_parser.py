@@ -38,7 +38,6 @@ from sklearn.metrics import silhouette_score
 
 from common.file_utils import get_project_base_directory
 from common.misc_utils import pip_install_torch
-from common.text_quality import is_gibberish, filter_gibberish
 from deepdoc.vision import OCR, AscendLayoutRecognizer, LayoutRecognizer, Recognizer, TableStructureRecognizer
 from rag.nlp import rag_tokenizer
 from rag.prompts.generator import vision_llm_describe_prompt
@@ -107,10 +106,6 @@ class RAGFlowPdfParser:
 
         self.page_from = 0
         self.column_num = 1
-        
-        # 添加OCR结果缓存，避免重复处理
-        self._ocr_cache = {}
-        self._ocr_cache_size = 1000
 
     def __char_width(self, c):
         return (c["x1"] - c["x0"]) // max(len(c["text"]), 1)
@@ -179,7 +174,7 @@ class RAGFlowPdfParser:
             abs(down["in_row"] - up["in_row"]),
             len(tks_down) == 1 and rag_tokenizer.tag(tks_down[0]).find("n") >= 0,
             len(tks_up) == 1 and rag_tokenizer.tag(tks_up[0]).find("n") >= 0,
-        ]
+            ]
         return fea
 
     @staticmethod
@@ -231,20 +226,7 @@ class RAGFlowPdfParser:
         best_score = -1
         best_angle = 0
         best_img = table_img
-
-        # Get table image size
-        width, height = table_img.size
-        
-        # Apply downsampling for faster OCR
-        max_size = 1000  # Maximum dimension for OCR
-        if width > max_size or height > max_size:
-            # Calculate downsampling factor
-            downsample_factor = min(max_size / width, max_size / height)
-            new_width = int(width * downsample_factor)
-            new_height = int(height * downsample_factor)
-            # Resize image
-            table_img = table_img.resize((new_width, new_height), resample=Image.LANCZOS)
-            logging.debug(f"Downsampled table image from ({width}x{height}) to ({new_width}x{new_height}) for faster OCR")
+        score_0 = None
 
         for angle, name in rotations:
             # Rotate image
@@ -282,6 +264,8 @@ class RAGFlowPdfParser:
                 combined_score = 0
 
             results[angle] = {"avg_confidence": avg_score, "total_regions": total_regions, "combined_score": combined_score}
+            if angle == 0:
+                score_0 = combined_score
 
             logging.debug(f"Table orientation {angle}°: avg_conf={avg_score:.4f}, regions={total_regions}, combined={combined_score:.4f}")
 
@@ -290,11 +274,17 @@ class RAGFlowPdfParser:
                 best_angle = angle
                 best_img = rotated_img
 
-        # For the best angle, use the original size image for final processing
-        if best_angle != 0:
-            best_img = table_img.rotate(-best_angle, expand=True)
+        # Absolute threshold rule:
+        # Only choose non-0° if it exceeds 0° by more than 0.2 and 0° score is below 0.8.
+        if best_angle != 0 and score_0 is not None:
+            if not (best_score - score_0 > 0.2 and score_0 < 0.8):
+                best_angle = 0
+                best_img = table_img
+                best_score = score_0
 
-        logging.debug(f"Best table orientation: {best_angle}° (score={best_score:.4f})")
+        results[best_angle] = results.get(best_angle, {"avg_confidence": 0, "total_regions": 0, "combined_score": 0})
+
+        logging.info(f"Best table orientation: {best_angle}° (score={best_score:.4f})")
 
         return best_angle, best_img, results
 
@@ -320,10 +310,6 @@ class RAGFlowPdfParser:
         self.table_rotations = {}  # Store rotation info for each table
         self.rotated_table_imgs = {}  # Store rotated table images
 
-        # Add table processing limit to avoid timeout
-        MAX_TABLES = 50  # Maximum number of tables to process
-        processed_tables = 0
-
         assert len(self.page_layout) == len(self.page_images)
 
         # Collect layout info for all tables
@@ -335,17 +321,7 @@ class RAGFlowPdfParser:
             tbcnt.append(len(tbls))
             if not tbls:
                 continue
-            
-            # Check if we've reached the maximum number of tables
-            if processed_tables >= MAX_TABLES:
-                logging.warning(f"Reached maximum table processing limit of {MAX_TABLES}, skipping remaining tables")
-                break
-            
             for tb in tbls:  # for table
-                # Check if we've reached the maximum number of tables
-                if processed_tables >= MAX_TABLES:
-                    break
-                
                 left, top, right, bott = tb["x0"] - MARGIN, tb["top"] - MARGIN, tb["x1"] + MARGIN, tb["bottom"] + MARGIN
                 left *= ZM
                 top *= ZM
@@ -359,33 +335,8 @@ class RAGFlowPdfParser:
                 # Crop table image
                 table_img = self.page_images[p].crop((left, top, right, bott))
 
-                # Check table complexity to skip orientation evaluation for simple tables
-                def is_simple_table(img, layout):
-                    """
-                    Check if a table is simple enough to skip orientation evaluation
-                    """
-                    width, height = img.size
-                    
-                    # Check table size - very small tables are likely simple
-                    if width < 200 or height < 200:
-                        return True
-                    
-                    # Check if table has very few rows/columns based on layout
-                    # Estimate complexity from bounding box size and aspect ratio
-                    bbox_width = layout["x1"] - layout["x0"]
-                    bbox_height = layout["bottom"] - layout["top"]
-                    
-                    # Very narrow or very wide tables are likely simple
-                    aspect_ratio = bbox_width / bbox_height if bbox_height > 0 else 0
-                    if aspect_ratio > 5 or aspect_ratio < 0.2:
-                        return True
-                    
-                    return False
-                
-                simple_table = is_simple_table(table_img, tb)
-                
-                if auto_rotate and not simple_table:
-                    # Evaluate table orientation only for complex tables
+                if auto_rotate:
+                    # Evaluate table orientation
                     logging.debug(f"Evaluating orientation for table {table_index} on page {p}")
                     best_angle, rotated_img, rotation_scores = self._evaluate_table_orientation(table_img)
 
@@ -402,40 +353,19 @@ class RAGFlowPdfParser:
                     self.rotated_table_imgs[table_index] = rotated_img
                     imgs.append(rotated_img)
 
-                    if best_angle != 0:
-                        logging.info(f"Table {table_index} on page {p}: rotated {best_angle}° for better recognition")
                 else:
-                    # For simple tables, use original image without orientation evaluation
-                    if simple_table:
-                        logging.debug(f"Skipping orientation evaluation for simple table {table_index} on page {p}")
                     imgs.append(table_img)
                     self.table_rotations[table_index] = {"page": p, "original_pos": (left, top, right, bott), "best_angle": 0, "scores": {}, "rotated_size": table_img.size}
                     self.rotated_table_imgs[table_index] = table_img
 
                 table_index += 1
-                processed_tables += 1
 
         assert len(self.page_images) == len(tbcnt) - 1
         if not imgs:
             return
 
-        # Perform table structure recognition (TSR) with batch processing to avoid memory issues
-        MAX_TSR_BATCH_SIZE = 10  # Maximum number of images to process in one batch
-        recos = []
-        
-        # Process images in batches
-        for i in range(0, len(imgs), MAX_TSR_BATCH_SIZE):
-            batch_imgs = imgs[i:i + MAX_TSR_BATCH_SIZE]
-            logging.debug(f"Processing TSR batch {i//MAX_TSR_BATCH_SIZE + 1}/{(len(imgs) + MAX_TSR_BATCH_SIZE - 1)//MAX_TSR_BATCH_SIZE} with {len(batch_imgs)} images")
-            
-            # Perform TSR on batch
-            batch_recos = self.tbl_det(batch_imgs)
-            recos.extend(batch_recos)
-            
-            # Force garbage collection to release memory
-            import gc
-            gc.collect()
-            logging.debug(f"Completed TSR batch, released memory")
+        # Perform table structure recognition (TSR)
+        recos = self.tbl_det(imgs)
 
         # If tables were rotated, re-OCR the rotated images and replace table boxes
         if auto_rotate:
@@ -517,6 +447,90 @@ class RAGFlowPdfParser:
         """
         tbcnt = np.cumsum(tbcnt)
 
+        def _table_region(layout, page_index):
+            table_x0 = layout["x0"]
+            table_top = layout["top"]
+            table_x1 = layout["x1"]
+            table_bottom = layout["bottom"]
+            table_top_cum = table_top + self.page_cum_height[page_index]
+            table_bottom_cum = table_bottom + self.page_cum_height[page_index]
+            return table_x0, table_top, table_x1, table_bottom, table_top_cum, table_bottom_cum
+
+        def _collect_table_boxes(page_index, table_x0, table_x1, table_top_cum, table_bottom_cum):
+            indices = [
+                i
+                for i, b in enumerate(self.boxes)
+                if (
+                        b.get("page_number") == page_index + self.page_from
+                        and b.get("layout_type") == "table"
+                        and b["x0"] >= table_x0 - 5
+                        and b["x1"] <= table_x1 + 5
+                        and b["top"] >= table_top_cum - 5
+                        and b["bottom"] <= table_bottom_cum + 5
+                )
+            ]
+            original_boxes = [self.boxes[i] for i in indices]
+            insert_at = indices[0] if indices else len(self.boxes)
+            for i in reversed(indices):
+                self.boxes.pop(i)
+            return original_boxes, insert_at
+
+        def _restore_boxes(original_boxes, insert_at):
+            for b in original_boxes:
+                self.boxes.insert(insert_at, b)
+                insert_at += 1
+            return insert_at
+
+        def _map_rotated_point(x, y, angle, width, height):
+            # Map a point from rotated image coords back to original image coords.
+            if angle == 0:
+                return x, y
+            if angle == 90:
+                # clockwise 90: original->rotated (x', y') = (y, width - x)
+                # inverse:
+                return width - y, x
+            if angle == 180:
+                return width - x, height - y
+            if angle == 270:
+                # clockwise 270: original->rotated (x', y') = (height - y, x)
+                # inverse:
+                return y, height - x
+            return x, y
+
+        def _insert_ocr_boxes(ocr_results, page_index, table_x0, table_top, insert_at, table_index, best_angle, table_w_px, table_h_px):
+            added = 0
+            for bbox, (text, conf) in ocr_results:
+                if conf < 0.5:
+                    continue
+                mapped = [_map_rotated_point(p[0], p[1], best_angle, table_w_px, table_h_px) for p in bbox]
+                x_coords = [p[0] for p in mapped]
+                y_coords = [p[1] for p in mapped]
+                box_x0 = min(x_coords) / ZM
+                box_x1 = max(x_coords) / ZM
+                box_top = min(y_coords) / ZM
+                box_bottom = max(y_coords) / ZM
+                new_box = {
+                    "text": text,
+                    "x0": box_x0 + table_x0,
+                    "x1": box_x1 + table_x0,
+                    "top": box_top + table_top + self.page_cum_height[page_index],
+                    "bottom": box_bottom + table_top + self.page_cum_height[page_index],
+                    "page_number": page_index + self.page_from,
+                    "layout_type": "table",
+                    "layoutno": f"table-{table_index}",
+                    "_rotated": True,
+                    "_rotation_angle": best_angle,
+                    "_table_index": table_index,
+                    "_rotated_x0": box_x0,
+                    "_rotated_x1": box_x1,
+                    "_rotated_top": box_top,
+                    "_rotated_bottom": box_bottom,
+                }
+                self.boxes.insert(insert_at, new_box)
+                insert_at += 1
+                added += 1
+            return added
+
         for tbl_info in table_layouts:
             table_index = tbl_info["table_index"]
             page = tbl_info["page"]
@@ -531,82 +545,42 @@ class RAGFlowPdfParser:
             if rotated_img is None:
                 continue
 
-            # If table was rotated, re-OCR the rotated image
-            if best_angle != 0:
-                logging.info(f"Re-OCR table {table_index} on page {page} with rotation {best_angle}°")
+            # If no rotation, keep original OCR boxes untouched.
+            if best_angle == 0:
+                continue
 
-                # Perform OCR on rotated image
-                img_array = np.array(rotated_img)
-                ocr_results = self.ocr(img_array)
+            # Table region is defined by layout's x0, top, x1, bottom (page-local coords)
+            table_x0, table_top, table_x1, table_bottom, table_top_cum, table_bottom_cum = _table_region(layout, page)
+            original_boxes, insert_at = _collect_table_boxes(page, table_x0, table_x1, table_top_cum, table_bottom_cum)
 
-                if not ocr_results:
-                    logging.warning(f"No OCR results for rotated table {table_index}")
-                    continue
+            logging.info(f"Re-OCR table {table_index} on page {page} with rotation {best_angle}°")
 
-                # Remove original text boxes from this table region in self.boxes
-                # Table region is defined by layout's x0, top, x1, bottom
-                table_x0 = layout["x0"]
-                table_top = layout["top"]
-                table_x1 = layout["x1"]
-                table_bottom = layout["bottom"]
+            # Perform OCR on rotated image
+            img_array = np.array(rotated_img)
+            ocr_results = self.ocr(img_array)
 
-                # Filter out original boxes within the table region
-                original_box_count = len(self.boxes)
-                self.boxes = [
-                    b
-                    for b in self.boxes
-                    if not (
-                        b.get("page_number") == page + self.page_from
-                        and b.get("layout_type") == "table"
-                        and b["x0"] >= table_x0 - 5
-                        and b["x1"] <= table_x1 + 5
-                        and b["top"] >= table_top - 5
-                        and b["bottom"] <= table_bottom + 5
-                    )
-                ]
-                removed_count = original_box_count - len(self.boxes)
-                logging.debug(f"Removed {removed_count} original boxes from table {table_index}")
+            if not ocr_results:
+                logging.warning(f"No OCR results for rotated table {table_index}, restoring originals")
+                _restore_boxes(original_boxes, insert_at)
+                continue
 
-                # Add new OCR results to self.boxes
-                # OCR coordinates are relative to rotated image, need to preserve
-                rotated_width, rotated_height = rotated_img.size
+            # Add new OCR results to self.boxes
+            # OCR coordinates are relative to rotated image, map back to original table coords
+            table_w_px = right - left
+            table_h_px = bott - top
+            added = _insert_ocr_boxes(
+                ocr_results,
+                page,
+                table_x0,
+                table_top,
+                insert_at,
+                table_index,
+                best_angle,
+                table_w_px,
+                table_h_px,
+            )
 
-                for bbox, (text, conf) in ocr_results:
-                    if conf < 0.5:  # Filter low confidence results
-                        continue
-
-                    # bbox format: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-                    x_coords = [p[0] for p in bbox]
-                    y_coords = [p[1] for p in bbox]
-
-                    # Coordinates in rotated image
-                    box_x0 = min(x_coords) / ZM
-                    box_x1 = max(x_coords) / ZM
-                    box_top = min(y_coords) / ZM
-                    box_bottom = max(y_coords) / ZM
-
-                    # Create new box, mark as from rotated table
-                    new_box = {
-                        "text": text,
-                        "x0": box_x0 + table_x0,  # Coordinates relative to page
-                        "x1": box_x1 + table_x0,
-                        "top": box_top + table_top + self.page_cum_height[page],
-                        "bottom": box_bottom + table_top + self.page_cum_height[page],
-                        "page_number": page + self.page_from,
-                        "layout_type": "table",
-                        "layoutno": f"table-{table_index}",
-                        "_rotated": True,
-                        "_rotation_angle": best_angle,
-                        "_table_index": table_index,
-                        # Save original coordinates in rotated image for table reconstruction
-                        "_rotated_x0": box_x0,
-                        "_rotated_x1": box_x1,
-                        "_rotated_top": box_top,
-                        "_rotated_bottom": box_bottom,
-                    }
-                    self.boxes.append(new_box)
-
-                logging.info(f"Added {len(ocr_results)} OCR results from rotated table {table_index}")
+            logging.info(f"Added {added} OCR results from rotated table {table_index}")
 
     def __ocr(self, pagenum, img, chars, ZM=3, device_id: int | None = None):
         start = timer()
@@ -625,7 +599,7 @@ class RAGFlowPdfParser:
                 if b[0][0] <= b[1][0] and b[0][1] <= b[-1][1]
             ],
             self.mean_height[pagenum - 1] / 3,
-        )
+            )
 
         # merge chars in the same rect
         for c in chars:
@@ -663,23 +637,7 @@ class RAGFlowPdfParser:
                 b["box_image"] = self.ocr.get_rotate_crop_image(img_np, np.array([[left, top], [right, top], [right, bott], [left, bott]], dtype=np.float32))
                 boxes_to_reg.append(b)
             del b["txt"]
-        
-        # Process OCR in batches to avoid memory issues
-        MAX_OCR_BATCH_SIZE = 20  # Maximum number of images to process in one batch
-        texts = []
-        
-        for i in range(0, len(boxes_to_reg), MAX_OCR_BATCH_SIZE):
-            batch_boxes = boxes_to_reg[i:i + MAX_OCR_BATCH_SIZE]
-            batch_images = [b["box_image"] for b in batch_boxes]
-            
-            # Process batch
-            batch_texts = self.ocr.recognize_batch(batch_images, device_id)
-            texts.extend(batch_texts)
-            
-            # Force garbage collection to release memory
-            import gc
-            gc.collect()
-        
+        texts = self.ocr.recognize_batch([b["box_image"] for b in boxes_to_reg], device_id)
         for i in range(len(boxes_to_reg)):
             boxes_to_reg[i]["text"] = texts[i]
             del boxes_to_reg[i]["box_image"]
@@ -694,12 +652,8 @@ class RAGFlowPdfParser:
         self.boxes, self.page_layout = self.layouter(self.page_images, self.boxes, ZM, drop=drop)
         # cumlative Y
         for i in range(len(self.boxes)):
-            page_idx = self.boxes[i]["page_number"] - 1
-            if 0 <= page_idx < len(self.page_cum_height):
-                self.boxes[i]["top"] += self.page_cum_height[page_idx]
-                self.boxes[i]["bottom"] += self.page_cum_height[page_idx]
-            else:
-                logging.warning(f"Invalid page index {page_idx} when updating box positions, skipping")
+            self.boxes[i]["top"] += self.page_cum_height[self.boxes[i]["page_number"] - 1]
+            self.boxes[i]["bottom"] += self.page_cum_height[self.boxes[i]["page_number"] - 1]
 
     def _assign_column(self, boxes, zoomin=3):
         if not boxes:
@@ -798,24 +752,6 @@ class RAGFlowPdfParser:
             tt = b.get("text", "").strip()
             return tt and any([tt.find(t.strip()) == 0 for t in txts])
 
-        # Filter gibberish before merging
-        filtered_bxs = []
-        for b in bxs:
-            text = b.get("text", "").strip()
-            if text:
-                # Filter out gibberish boxes
-                if not is_gibberish(text):
-                    # Filter gibberish content within the box
-                    filtered_text = filter_gibberish(text)
-                    if filtered_text:
-                        b["text"] = filtered_text
-                        filtered_bxs.append(b)
-                else:
-                    logging.debug(f"Filtered gibberish box: {text[:100]}...")
-            else:
-                filtered_bxs.append(b)
-        bxs = filtered_bxs
-
         # horizontally merge adjacent box with the same layout
         i = 0
         while i < len(bxs) - 1:
@@ -830,13 +766,11 @@ class RAGFlowPdfParser:
                 i += 1
                 continue
 
-            page_idx = bxs[i]["page_number"] - 1
-            if 0 <= page_idx < len(self.mean_height):
-                if abs(self._y_dis(b, b_)) < self.mean_height[page_idx] / 3:
-                    # merge
-                    bxs[i]["x1"] = b_["x1"]
-                    bxs[i]["top"] = (b["top"] + b_["top"]) / 2
-                    bxs[i]["bottom"] = (b["bottom"] + b_["bottom"]) / 2
+            if abs(self._y_dis(b, b_)) < self.mean_height[bxs[i]["page_number"] - 1] / 3:
+                # merge
+                bxs[i]["x1"] = b_["x1"]
+                bxs[i]["top"] = (b["top"] + b_["top"]) / 2
+                bxs[i]["bottom"] = (b["bottom"] + b_["bottom"]) / 2
                 bxs[i]["text"] += b_["text"]
                 bxs.pop(i + 1)
                 continue
@@ -846,24 +780,6 @@ class RAGFlowPdfParser:
     def _naive_vertical_merge(self, zoomin=3):
         # bxs = self._assign_column(self.boxes, zoomin)
         bxs = self.boxes
-
-        # Filter gibberish before merging
-        filtered_bxs = []
-        for b in bxs:
-            text = b.get("text", "").strip()
-            if text:
-                # Filter out gibberish boxes
-                if not is_gibberish(text):
-                    # Filter gibberish content within the box
-                    filtered_text = filter_gibberish(text)
-                    if filtered_text:
-                        b["text"] = filtered_text
-                        filtered_bxs.append(b)
-                else:
-                    logging.debug(f"Filtered gibberish box: {text[:100]}...")
-            else:
-                filtered_bxs.append(b)
-        bxs = filtered_bxs
 
         grouped = defaultdict(list)
         for b in bxs:
@@ -908,15 +824,15 @@ class RAGFlowPdfParser:
                     b["text"].strip()[-1] in ",;:'\"，、‘“；：-",
                     len(b["text"].strip()) > 1 and b["text"].strip()[-2] in ",;:'\"，‘“、；：",
                     b_["text"].strip() and b_["text"].strip()[0] in "。；？！?”）),，、：",
-                ]
+                    ]
                 # features for not concating
                 feats = [
                     b.get("layoutno", 0) != b_.get("layoutno", 0),
                     b["text"].strip()[-1] in "。？！?",
                     self.is_english and b["text"].strip()[-1] in ".!?",
-                    (b["page_number"] == b_["page_number"] and 0 <= b["page_number"] - 1 < len(self.mean_height) and b_["top"] - b["bottom"] > self.mean_height[b["page_number"] - 1] * 1.5),
-                    (b["page_number"] < b_["page_number"] and 0 <= b["page_number"] - 1 < len(self.mean_width) and abs(b["x0"] - b_["x0"]) > self.mean_width[b["page_number"] - 1] * 4),
-                ]
+                    b["page_number"] == b_["page_number"] and b_["top"] - b["bottom"] > self.mean_height[b["page_number"] - 1] * 1.5,
+                    b["page_number"] < b_["page_number"] and abs(b["x0"] - b_["x0"]) > self.mean_width[b["page_number"] - 1] * 4,
+                    ]
                 # split features
                 detach_feats = [b["x1"] < b_["x0"], b["x0"] > b_["x1"]]
                 if (any(feats) and not any(concatting_feats)) or any(detach_feats):
@@ -967,16 +883,11 @@ class RAGFlowPdfParser:
 
     def _concat_downward(self, concat_between_pages=True):
         self.boxes = Recognizer.sort_Y_firstly(self.boxes, 0)
+        return
 
         # count boxes in the same row as a feature
         for i in range(len(self.boxes)):
-            page_idx = self.boxes[i]["page_number"] - 1
-            # 检查mean_height边界
-            if page_idx < 0 or page_idx >= len(self.mean_height):
-                logging.warning(f"Invalid page index {page_idx} in _concat_downward, using default mean height")
-                mh = 1.0  # 默认值
-            else:
-                mh = self.mean_height[page_idx]
+            mh = self.mean_height[self.boxes[i]["page_number"] - 1]
             self.boxes[i]["in_row"] = 0
             j = max(0, i - 12)
             while j < min(i + 12, len(self.boxes)):
@@ -1002,14 +913,8 @@ class RAGFlowPdfParser:
                 while i < min(dp + 12, len(boxes)):
                     ydis = self._y_dis(up, boxes[i])
                     smpg = up["page_number"] == boxes[i]["page_number"]
-                    page_idx = up["page_number"] - 1
-                    if 0 <= page_idx < len(self.mean_height) and 0 <= page_idx < len(self.mean_width):
-                        mh = self.mean_height[page_idx]
-                        mw = self.mean_width[page_idx]
-                    else:
-                        mh = 1.0
-                        mw = 1.0
-                        logging.warning(f"Invalid page index {page_idx} in _assign_column, using default values")
+                    mh = self.mean_height[up["page_number"] - 1]
+                    mw = self.mean_width[up["page_number"] - 1]
                     if smpg and ydis > mh * 4:
                         break
                     if not smpg and ydis > mh * 16:
@@ -1115,11 +1020,7 @@ class RAGFlowPdfParser:
         page_dirty = [0] * len(self.page_images)
         for b in self.boxes:
             if re.search(r"(··|··|··)", b["text"]):
-                page_idx = b["page_number"] - 1
-                if 0 <= page_idx < len(page_dirty):
-                    page_dirty[page_idx] += 1
-                else:
-                    logging.warning(f"Invalid page index {page_idx} in _text_merge, skipping")
+                page_dirty[b["page_number"] - 1] += 1
         page_dirty = set([i + 1 for i, t in enumerate(page_dirty) if t > 3])
         if not page_dirty:
             return
@@ -1143,10 +1044,10 @@ class RAGFlowPdfParser:
                 continue
 
             if (
-                b["text"].strip()[0] != b_["text"].strip()[0]
-                or b["text"].strip()[0].lower() in set("qwertyuopasdfghjklzxcvbnm")
-                or rag_tokenizer.is_chinese(b["text"].strip()[0])
-                or b["top"] > b_["bottom"]
+                    b["text"].strip()[0] != b_["text"].strip()[0]
+                    or b["text"].strip()[0].lower() in set("qwertyuopasdfghjklzxcvbnm")
+                    or rag_tokenizer.is_chinese(b["text"].strip()[0])
+                    or b["top"] > b_["bottom"]
             ):
                 i += 1
                 continue
@@ -1207,14 +1108,8 @@ class RAGFlowPdfParser:
                 continue
             if bxs[0]["page_number"] - bxs0[0]["page_number"] > 1:
                 continue
-            page_idx = bxs[0]["page_number"] - 1
-            if 0 <= page_idx < len(self.mean_height):
-                mh = self.mean_height[page_idx]
-                if self._y_dis(bxs0[-1], bxs[0]) > mh * 23:
-                    continue
-            else:
-                # Skip if page index is invalid
-                logging.warning(f"Invalid page index {page_idx} in _extract_table_figure, skipping merge")
+            mh = self.mean_height[bxs[0]["page_number"] - 1]
+            if self._y_dis(bxs0[-1], bxs[0]) > mh * 23:
                 continue
             tables[k0].extend(tables[k])
             del tables[k]
@@ -1263,25 +1158,32 @@ class RAGFlowPdfParser:
 
         def cropout(bxs, ltype, poss):
             nonlocal ZM
-            pn = set([b["page_number"] - 1 for b in bxs])
+            max_page_index = len(self.page_images) - 1
+
+            def local_page_index(page_number):
+                idx = page_number - 1 if page_number > 0 else 0
+                if idx > max_page_index and self.page_from:
+                    idx = page_number - 1 - self.page_from
+                return idx
+
+            pn = set()
+            for b in bxs:
+                idx = local_page_index(b["page_number"])
+                if 0 <= idx <= max_page_index:
+                    pn.add(idx)
+                else:
+                    logging.warning(
+                        "Skip out-of-range page_number %s (page_from=%s, pages=%s)",
+                        b.get("page_number"),
+                        self.page_from,
+                        len(self.page_images),
+                    )
+
+            if not pn:
+                return None
+
             if len(pn) < 2:
                 pn = list(pn)[0]
-
-                # 添加边界检查
-                if pn >= len(self.page_cum_height):
-                    logging.warning(f"Page index {pn} exceeds page_cum_height length {len(self.page_cum_height)}, using last available page")
-                    pn = min(pn, len(self.page_cum_height) - 1)
-
-                # 检查page_layout边界
-                if pn >= len(self.page_layout):
-                    logging.warning(f"Page index {pn} exceeds page_layout length {len(self.page_layout)}, using last available page")
-                    pn = min(pn, len(self.page_layout) - 1)
-
-                # 检查page_images边界
-                if pn >= len(self.page_images):
-                    logging.warning(f"Page index {pn} exceeds page_images length {len(self.page_images)}, using last available page")
-                    pn = min(pn, len(self.page_images) - 1)
-
                 ht = self.page_cum_height[pn]
                 b = {"x0": np.min([b["x0"] for b in bxs]), "top": np.min([b["top"] for b in bxs]) - ht, "x1": np.max([b["x1"] for b in bxs]), "bottom": np.max([b["bottom"] for b in bxs]) - ht}
                 louts = [layout for layout in self.page_layout[pn] if layout["type"] == ltype]
@@ -1296,20 +1198,18 @@ class RAGFlowPdfParser:
                     right = left + 1
                 poss.append((pn + self.page_from, left, right, top, bott))
                 return self.page_images[pn].crop((left * ZM, top * ZM, right * ZM, bott * ZM))
-
             pn = {}
             for b in bxs:
-                p = b["page_number"] - 1
-                # 检查页面索引是否有效
-                if p < len(self.page_cum_height):
+                p = local_page_index(b["page_number"])
+                if 0 <= p <= max_page_index:
                     if p not in pn:
                         pn[p] = []
                     pn[p].append(b)
-                else:
-                    logging.warning(f"Skipping invalid page index {p}, max allowed: {len(self.page_cum_height) - 1}")
-
             pn = sorted(pn.items(), key=lambda x: x[0])
             imgs = [cropout(arr, ltype, poss) for p, arr in pn]
+            imgs = [img for img in imgs if img is not None]
+            if not imgs:
+                return None
             pic = Image.new("RGB", (int(np.max([i.size[0] for i in imgs])), int(np.sum([m.size[1] for m in imgs]))), (245, 245, 245))
             height = 0
             for img in imgs:
@@ -1330,10 +1230,16 @@ class RAGFlowPdfParser:
             poss = []
 
             if separate_tables_figures:
-                figure_results.append((cropout(bxs, "figure", poss), [txt]))
+                img = cropout(bxs, "figure", poss)
+                if img is None:
+                    continue
+                figure_results.append((img, [txt]))
                 figure_positions.append(poss)
             else:
-                res.append((cropout(bxs, "figure", poss), [txt]))
+                img = cropout(bxs, "figure", poss)
+                if img is None:
+                    continue
+                res.append((img, [txt]))
                 positions.append(poss)
 
         for k, bxs in tables.items():
@@ -1343,7 +1249,10 @@ class RAGFlowPdfParser:
 
             poss = []
 
-            res.append((cropout(bxs, "table", poss), self.tbl_det.construct_table(bxs, html=return_html, is_english=self.is_english)))
+            img = cropout(bxs, "table", poss)
+            if img is None:
+                continue
+            res.append((img, self.tbl_det.construct_table(bxs, html=return_html, is_english=self.is_english)))
             positions.append(poss)
 
         if separate_tables_figures:
@@ -1385,13 +1294,8 @@ class RAGFlowPdfParser:
 
     def _line_tag(self, bx, ZM):
         pn = [bx["page_number"]]
-        page_idx = pn[0] - 1
-        # 检查page_cum_height边界
-        if page_idx < 0 or page_idx >= len(self.page_cum_height):
-            logging.warning(f"Invalid page index {page_idx} in _line_tag, returning empty tag")
-            return ""
-        top = bx["top"] - self.page_cum_height[page_idx]
-        bott = bx["bottom"] - self.page_cum_height[page_idx]
+        top = bx["top"] - self.page_cum_height[pn[0] - 1]
+        bott = bx["bottom"] - self.page_cum_height[pn[0] - 1]
         page_images_cnt = len(self.page_images)
         if pn[-1] - 1 >= page_images_cnt:
             return ""
@@ -1413,10 +1317,9 @@ class RAGFlowPdfParser:
         def usefull(b):
             if b.get("layout_type"):
                 return True
-            page_idx = b["page_number"] - 1
-            if 0 <= page_idx < len(self.page_images) and width(b) > self.page_images[page_idx].size[0] / ZM / 3:
+            if width(b) > self.page_images[b["page_number"] - 1].size[0] / ZM / 3:
                 return True
-            if 0 <= page_idx < len(self.mean_height) and b["bottom"] - b["top"] > self.mean_height[page_idx]:
+            if b["bottom"] - b["top"] > self.mean_height[b["page_number"] - 1]:
                 return True
             return False
 
@@ -1424,14 +1327,8 @@ class RAGFlowPdfParser:
         while boxes:
             lines = []
             widths = []
-            page_idx = boxes[0]["page_number"] - 1
-            if 0 <= page_idx < len(self.page_images) and 0 <= page_idx < len(self.mean_height):
-                pw = self.page_images[page_idx].size[0] / ZM
-                mh = self.mean_height[page_idx]
-            else:
-                pw = 1000  # 默认值
-                mh = 1.0  # 默认值
-                logging.warning(f"Invalid page index {page_idx} in __filterout_scraps, using default values")
+            pw = self.page_images[boxes[0]["page_number"] - 1].size[0] / ZM
+            mh = self.mean_height[boxes[0]["page_number"] - 1]
             mj = self.proj_match(boxes[0]["text"]) or boxes[0].get("layout_type", "") == "title"
 
             def dfs(line, st):
@@ -1545,10 +1442,10 @@ class RAGFlowPdfParser:
             j = 0
             while j + 1 < len(chars):
                 if (
-                    chars[j]["text"]
-                    and chars[j + 1]["text"]
-                    and re.match(r"[0-9a-zA-Z,.:;!%]+", chars[j]["text"] + chars[j + 1]["text"])
-                    and chars[j + 1]["x0"] - chars[j]["x1"] >= min(chars[j + 1]["width"], chars[j]["width"]) / 2
+                        chars[j]["text"]
+                        and chars[j + 1]["text"]
+                        and re.match(r"[0-9a-zA-Z,.:;!%]+", chars[j]["text"] + chars[j + 1]["text"])
+                        and chars[j + 1]["x0"] - chars[j]["x1"] >= min(chars[j + 1]["width"], chars[j]["width"]) / 2
                 ):
                     chars[j]["text"] += " "
                 j += 1
@@ -1585,7 +1482,7 @@ class RAGFlowPdfParser:
                             img,
                             chars,
                             semaphore,
-                        )
+                            )
 
                     tasks.append(asyncio.create_task(wrapper()))
                     await asyncio.sleep(0)

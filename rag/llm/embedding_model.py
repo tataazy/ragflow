@@ -16,10 +16,8 @@
 import json
 import os
 import threading
-import hashlib
 from abc import ABC
 from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor
 
 import dashscope
 import google.generativeai as genai
@@ -50,116 +48,6 @@ class Base(ABC):
 
     def encode_queries(self, text: str):
         raise NotImplementedError("Please implement encode method!")
-
-
-class CachedEmbed(Base):
-    """
-    带缓存功能的嵌入模型包装器
-    """
-    def __init__(self, embed_model, cache_size=10000):
-        """
-        初始化缓存嵌入模型
-        
-        Args:
-            embed_model: 原始嵌入模型实例
-            cache_size: 缓存大小，默认10000
-        """
-        self.embed_model = embed_model
-        self.cache = {}
-        self.cache_size = cache_size
-        self.lock = threading.RLock()
-        logging.info(f"Initialized CachedEmbed with cache size: {cache_size}")
-    
-    def _get_cache_key(self, text):
-        """
-        生成缓存键
-        
-        Args:
-            text: 文本内容
-            
-        Returns:
-            str: 缓存键
-        """
-        return hashlib.md5(text.encode('utf-8')).hexdigest()
-    
-    def encode(self, texts: list):
-        """
-        编码文本列表，使用缓存
-        
-        Args:
-            texts: 文本列表
-            
-        Returns:
-            tuple: (嵌入向量数组, 令牌数)
-        """
-        cached_indices = []
-        cached_embeddings = []
-        uncached_texts = []
-        uncached_positions = []
-        
-        # 检查缓存
-        with self.lock:
-            for i, text in enumerate(texts):
-                key = self._get_cache_key(text)
-                if key in self.cache:
-                    cached_indices.append(i)
-                    cached_embeddings.append(self.cache[key])
-                else:
-                    uncached_texts.append(text)
-                    uncached_positions.append(i)
-        
-        # 处理未缓存的文本
-        if uncached_texts:
-            new_embeddings, token_count = self.embed_model.encode(uncached_texts)
-            
-            # 更新缓存
-            with self.lock:
-                if len(self.cache) >= self.cache_size:
-                    # 简单的LRU策略：删除最早的缓存项
-                    oldest_keys = list(self.cache.keys())[:len(uncached_texts)]
-                    for key in oldest_keys:
-                        self.cache.pop(key, None)
-                
-                for text, embedding in zip(uncached_texts, new_embeddings):
-                    key = self._get_cache_key(text)
-                    self.cache[key] = embedding
-        else:
-            token_count = 0
-            new_embeddings = []
-        
-        # 合并结果
-        result = [None] * len(texts)
-        for i, emb in zip(cached_indices, cached_embeddings):
-            result[i] = emb
-        for i, pos in enumerate(uncached_positions):
-            result[pos] = new_embeddings[i]
-        
-        return np.array(result), token_count
-    
-    def encode_queries(self, text):
-        """
-        编码查询文本，使用缓存
-        
-        Args:
-            text: 查询文本
-            
-        Returns:
-            tuple: (嵌入向量, 令牌数)
-        """
-        key = self._get_cache_key(text)
-        with self.lock:
-            if key in self.cache:
-                return self.cache[key], 0
-        
-        embedding, token_count = self.embed_model.encode_queries(text)
-        with self.lock:
-            if len(self.cache) >= self.cache_size:
-                # 删除最早的缓存项
-                oldest_key = list(self.cache.keys())[0]
-                self.cache.pop(oldest_key, None)
-            self.cache[key] = embedding
-        
-        return embedding, token_count
 
 
 class BuiltinEmbed(Base):
@@ -246,8 +134,6 @@ class LocalAIEmbed(Base):
 
     def encode(self, texts: list):
         batch_size = 16
-        # Truncate texts to avoid token length errors
-        texts = [truncate(t, 8191) for t in texts]
         ress = []
         for i in range(0, len(texts), batch_size):
             res = self.client.embeddings.create(input=texts[i : i + batch_size], model=self.model_name)
@@ -260,8 +146,6 @@ class LocalAIEmbed(Base):
         return np.array(ress), 1024
 
     def encode_queries(self, text):
-        # Truncate text to avoid token length errors
-        text = truncate(text, 8191)
         embds, cnt = self.encode([text])
         return np.array(embds[0]), cnt
 
@@ -293,24 +177,21 @@ class QWenEmbed(Base):
     def __init__(self, key, model_name="text_embedding_v2", **kwargs):
         self.key = key
         self.model_name = model_name
-        self.batch_size = 8
 
     def encode(self, texts: list):
         import time
 
         import dashscope
 
-        batch_size = self.batch_size
+        batch_size = 4
         res = []
         token_count = 0
         texts = [truncate(t, 2048) for t in texts]
         for i in range(0, len(texts), batch_size):
             retry_max = 5
-            retry_delay = 2
             resp = dashscope.TextEmbedding.call(model=self.model_name, input=texts[i : i + batch_size], api_key=self.key, text_type="document")
             while (resp["output"] is None or resp["output"].get("embeddings") is None) and retry_max > 0:
-                time.sleep(retry_delay)
-                retry_delay *= 2
+                time.sleep(10)
                 resp = dashscope.TextEmbedding.call(model=self.model_name, input=texts[i : i + batch_size], api_key=self.key, text_type="document")
                 retry_max -= 1
             if retry_max == 0 and (resp["output"] is None or resp["output"].get("embeddings") is None):
@@ -345,7 +226,6 @@ class ZhipuEmbed(Base):
     def __init__(self, key, model_name="embedding-2", **kwargs):
         self.client = ZhipuAI(api_key=key)
         self.model_name = model_name
-        self.batch_size = 16  # 批量处理大小
 
     def encode(self, texts: list):
         arr = []
@@ -358,35 +238,14 @@ class ZhipuEmbed(Base):
         if MAX_LEN > 0:
             texts = [truncate(t, MAX_LEN) for t in texts]
 
-        # 批量处理
-        batch_size = self.batch_size
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i+batch_size]
+        for txt in texts:
+            res = self.client.embeddings.create(input=txt, model=self.model_name)
             try:
-                # 尝试批量处理
-                res = self.client.embeddings.create(input=batch_texts, model=self.model_name)
-                try:
-                    arr.extend([d.embedding for d in res.data])
-                    tks_num += total_token_count_from_response(res)
-                    logging.debug(f"Processed batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size} successfully")
-                except Exception as _e:
-                    log_exception(_e, res)
-                    raise Exception(f"Error: {res}")
-            except Exception as e:
-                # 如果不支持批量处理，回退到逐个处理
-                logging.warning(f"Batch processing failed: {e}, falling back to individual processing")
-                for txt in batch_texts:
-                    try:
-                        res = self.client.embeddings.create(input=txt, model=self.model_name)
-                        try:
-                            arr.append(res.data[0].embedding)
-                            tks_num += total_token_count_from_response(res)
-                        except Exception as _e:
-                            log_exception(_e, res)
-                            raise Exception(f"Error: {res}")
-                    except Exception as _e:
-                        log_exception(_e, res)
-                        raise Exception(f"Error: {res}")
+                arr.append(res.data[0].embedding)
+                tks_num += total_token_count_from_response(res)
+            except Exception as _e:
+                log_exception(_e, res)
+                raise Exception(f"Error: {res}")
         return np.array(arr), tks_num
 
     def encode_queries(self, text):
@@ -407,45 +266,21 @@ class OllamaEmbed(Base):
         self.client = Client(host=kwargs["base_url"]) if not key or key == "x" else Client(host=kwargs["base_url"], headers={"Authorization": f"Bearer {key}"})
         self.model_name = model_name
         self.keep_alive = kwargs.get("ollama_keep_alive", int(os.environ.get("OLLAMA_KEEP_ALIVE", -1)))
-        self.batch_size = 8  # 批量处理大小
-
-    def _process_text(self, txt):
-        """
-        处理单个文本，移除特殊标记并获取嵌入
-        
-        Args:
-            txt: 文本内容
-            
-        Returns:
-            list: 嵌入向量
-        """
-        # remove special tokens if they exist
-        for token in OllamaEmbed._special_tokens:
-            txt = txt.replace(token, "")
-        res = self.client.embeddings(prompt=txt, model=self.model_name, options={"use_mmap": True}, keep_alive=self.keep_alive)
-        try:
-            return res["embedding"]
-        except Exception as _e:
-            log_exception(_e, res)
-            raise Exception(f"Error: {res}")
 
     def encode(self, texts: list):
         arr = []
         tks_num = 0
-        batch_size = self.batch_size
-        
-        # 批量处理
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i+batch_size]
-            logging.debug(f"Processing batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size} with {len(batch_texts)} texts")
-            
-            # 使用线程池并行处理
-            with ThreadPoolExecutor(max_workers=min(batch_size, os.cpu_count())) as executor:
-                batch_results = list(executor.map(self._process_text, batch_texts))
-            
-            arr.extend(batch_results)
-            tks_num += len(batch_texts) * 128
-        
+        for txt in texts:
+            # remove special tokens if they exist base on regex in one request
+            for token in OllamaEmbed._special_tokens:
+                txt = txt.replace(token, "")
+            res = self.client.embeddings(prompt=txt, model=self.model_name, options={"use_mmap": True}, keep_alive=self.keep_alive)
+            try:
+                arr.append(res["embedding"])
+            except Exception as _e:
+                log_exception(_e, res)
+                raise Exception(f"Error: {res}")
+            tks_num += 128
         return np.array(arr), tks_num
 
     def encode_queries(self, text):
@@ -544,7 +379,7 @@ class JinaMultiVecEmbed(Base):
             data = {"model": self.model_name, "input": input[i : i + batch_size]}
             if "v4" in self.model_name:
                 data["return_multivector"] = True
-            
+
             if "v3" in self.model_name or "v4" in self.model_name:
                 data['task'] = task
                 data['truncate'] = True
@@ -556,7 +391,7 @@ class JinaMultiVecEmbed(Base):
                     if data.get("return_multivector", False): # v4
                         token_embs = np.asarray(d['embeddings'], dtype=np.float32)
                         chunk_emb = token_embs.mean(axis=0)
-                    
+
                     else:
                         # v2/v3
                         chunk_emb = np.asarray(d['embedding'], dtype=np.float32)
@@ -583,19 +418,16 @@ class MistralEmbed(Base):
         self.client = MistralClient(api_key=key)
         self.model_name = model_name
 
-        self.batch_size = 16
-
     def encode(self, texts: list):
         import time
         import random
 
         texts = [truncate(t, 8196) for t in texts]
-        batch_size = self.batch_size
+        batch_size = 16
         ress = []
         token_count = 0
         for i in range(0, len(texts), batch_size):
             retry_max = 5
-            retry_delay = 2
             while retry_max > 0:
                 try:
                     res = self.client.embeddings(input=texts[i : i + batch_size], model=self.model_name)
@@ -605,10 +437,8 @@ class MistralEmbed(Base):
                 except Exception as _e:
                     if retry_max == 1:
                         log_exception(_e)
-                        raise
-                    delay = retry_delay + random.uniform(0, 1)
+                    delay = random.uniform(20, 60)
                     time.sleep(delay)
-                    retry_delay *= 2
                     retry_max -= 1
         return np.array(ress), token_count
 
@@ -616,7 +446,6 @@ class MistralEmbed(Base):
         import time
         import random
         retry_max = 5
-        retry_delay = 2
         while retry_max > 0:
             try:
                 res = self.client.embeddings(input=[truncate(text, 8196)], model=self.model_name)
@@ -624,10 +453,8 @@ class MistralEmbed(Base):
             except Exception as _e:
                 if retry_max == 1:
                     log_exception(_e)
-                    raise
-                delay = retry_delay + random.uniform(0, 1)
+                delay = random.randint(20, 60)
                 time.sleep(delay)
-                retry_delay *= 2
                 retry_max -= 1
 
 
@@ -654,7 +481,7 @@ class BedrockEmbed(Base):
         self.model_name = model_name
         self.is_amazon = self.model_name.split(".")[0] == "amazon"
         self.is_cohere = self.model_name.split(".")[0] == "cohere"
-        
+
         if mode == "access_key_secret":
             self.bedrock_ak = key.get("bedrock_ak")
             self.bedrock_sk = key.get("bedrock_sk")
@@ -760,7 +587,6 @@ class NvidiaEmbed(Base):
             "authorization": f"Bearer {self.api_key}",
         }
         self.model_name = model_name
-        self.batch_size = 16
         if model_name == "nvidia/embed-qa-4":
             self.base_url = "https://ai.api.nvidia.com/v1/retrieval/nvidia/embeddings"
             self.model_name = "NV-Embed-QA"
@@ -768,7 +594,7 @@ class NvidiaEmbed(Base):
             self.base_url = "https://ai.api.nvidia.com/v1/retrieval/snowflake/arctic-embed-l/embeddings"
 
     def encode(self, texts: list):
-        batch_size = self.batch_size
+        batch_size = 16
         ress = []
         token_count = 0
         for i in range(0, len(texts), batch_size):
@@ -817,79 +643,19 @@ class OpenAI_APIEmbed(OpenAIEmbed):
 
     def encode(self, texts: list):
         # OpenAI requires batch size <=16
-        from common.token_utils import num_tokens_from_string
-        
+        batch_size = 16
         # 确保每个输入都被截断到模型的最大 token 限制
-        max_token_per_text = 7000  # 更保守的单文本token限制
-        max_total_tokens = 7000  # 更保守的总token限制
-        
-        texts = [truncate(t, max_token_per_text) for t in texts]
+        texts = [truncate(t, 8191) for t in texts]
         ress = []
         total_tokens = 0
-        i = 0
-        
-        while i < len(texts):
-            # 动态计算batch_size，确保总token数不超过限制
-            current_batch = []
-            current_total_tokens = 0
-            batch_size = 16  # 初始batch_size
-            
-            # 尝试构建一个不超过token限制的batch
-            for j in range(i, min(i + batch_size, len(texts))):
-                text_tokens = num_tokens_from_string(texts[j])
-                if current_total_tokens + text_tokens > max_total_tokens:
-                    # 如果添加当前文本会超过限制，停止构建batch
-                    break
-                current_batch.append(texts[j])
-                current_total_tokens += text_tokens
-            
-            # 如果batch为空（单个文本就超过限制），进一步截断该文本
-            if not current_batch:
-                # 尝试将第一个文本截断到更短
-                short_text = truncate(texts[i], int(max_total_tokens * 0.8))
-                current_batch = [short_text]
-                current_total_tokens = num_tokens_from_string(short_text)
-                logging.warning(f"Single text too long, truncated to {current_total_tokens} tokens")
-            
-            logging.info(f"Sending batch with {len(current_batch)} texts, total tokens: {current_total_tokens}")
-            
-            # 发送请求，添加错误处理
-            max_retries = 3
-            retry_count = 0
-            
-            while retry_count < max_retries:
-                try:
-                    logging.info(f"Sending batch with {len(current_batch)} texts, total tokens: {current_total_tokens}")
-                    res = self.client.embeddings.create(input=current_batch, model=self.model_name, encoding_format="float")
-                    ress.extend([d.embedding for d in res.data])
-                    total_tokens += total_token_count_from_response(res)
-                    break
-                except Exception as e:
-                    retry_count += 1
-                    if "maximum context length" in str(e) and retry_count < max_retries:
-                        # 如果是token长度错误，减小batch大小并重试
-                        logging.warning(f"Token length error: {e}, retrying with smaller batch (attempt {retry_count}/{max_retries})")
-                        # 减小batch大小，每次减半
-                        if len(current_batch) > 1:
-                            current_batch = current_batch[:len(current_batch)//2]
-                            current_total_tokens = sum(num_tokens_from_string(t) for t in current_batch)
-                            logging.info(f"Retrying with {len(current_batch)} texts, total tokens: {current_total_tokens}")
-                        else:
-                            # 如果只有一个文本，进一步截断
-                            # 使用更保守的截断比例
-                            truncate_length = int(max_total_tokens * 0.5)
-                            short_text = truncate(current_batch[0], truncate_length)
-                            current_batch = [short_text]
-                            current_total_tokens = num_tokens_from_string(short_text)
-                            logging.warning(f"Single text still too long, truncated to {current_total_tokens} tokens (target: {truncate_length})")
-                    else:
-                        # 其他错误，直接抛出
-                        log_exception(e, str(current_batch[:100]) + "..." if len(str(current_batch)) > 100 else current_batch)
-                        raise
-            
-            # 移动到下一个batch
-            i += len(current_batch)
-        
+        for i in range(0, len(texts), batch_size):
+            res = self.client.embeddings.create(input=texts[i : i + batch_size], model=self.model_name, encoding_format="float")
+            try:
+                ress.extend([d.embedding for d in res.data])
+                total_tokens += total_token_count_from_response(res)
+            except Exception as _e:
+                log_exception(_e, res)
+                raise Exception(f"Error: {res}")
         return np.array(ress), total_tokens
 
 
@@ -901,10 +667,9 @@ class CoHereEmbed(Base):
 
         self.client = Client(api_key=key)
         self.model_name = model_name
-        self.batch_size = 16
 
     def encode(self, texts: list):
-        batch_size = self.batch_size
+        batch_size = 16
         ress = []
         token_count = 0
         for i in range(0, len(texts), batch_size):
@@ -1028,10 +793,9 @@ class ReplicateEmbed(Base):
 
         self.model_name = model_name
         self.client = Client(api_token=key)
-        self.batch_size = 16
 
     def encode(self, texts: list):
-        batch_size = self.batch_size
+        batch_size = 16
         token_count = sum([num_tokens_from_string(text) for text in texts])
         ress = []
         for i in range(0, len(texts), batch_size):
@@ -1087,10 +851,9 @@ class VoyageEmbed(Base):
 
         self.client = voyageai.Client(api_key=key)
         self.model_name = model_name
-        self.batch_size = 16
 
     def encode(self, texts: list):
-        batch_size = self.batch_size
+        batch_size = 16
         ress = []
         token_count = 0
         for i in range(0, len(texts), batch_size):

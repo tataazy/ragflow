@@ -14,13 +14,9 @@
 #  limitations under the License.
 
 import time
-import gc
-import psutil
 
 
 from common.misc_utils import thread_pool_exec
-from common.text_quality import is_gibberish, filter_gibberish
-from rag.llm.embedding_model import CachedEmbed
 
 start_ts = time.time()
 
@@ -134,25 +130,6 @@ minio_limiter = asyncio.Semaphore(MAX_CONCURRENT_MINIO)
 kg_limiter = asyncio.Semaphore(2)
 WORKER_HEARTBEAT_TIMEOUT = int(os.environ.get('WORKER_HEARTBEAT_TIMEOUT', '120'))
 stop_event = threading.Event()
-
-
-def check_memory_usage():
-    """检查内存使用情况，超过阈值时自动退出"""
-    process = psutil.Process()
-    memory_usage = process.memory_info().rss / 1024 / 1024 / 1024  # GB
-    logging.info(f"Current memory usage: {memory_usage:.2f} GB")
-    # 设置内存使用阈值，超过阈值时自动退出
-    memory_threshold = 40  # 12GB threshold
-    if memory_usage > memory_threshold:
-        logging.error(f"Memory usage too high: {memory_usage:.2f} GB, exiting...")
-        # 清理资源
-        gc.collect()
-        # 再次检查内存使用
-        memory_usage_after_gc = process.memory_info().rss / 1024 / 1024 / 1024
-        logging.info(f"Memory usage after GC: {memory_usage_after_gc:.2f} GB")
-        if memory_usage_after_gc > memory_threshold:
-            logging.error(f"Memory usage still too high after GC: {memory_usage_after_gc:.2f} GB, exiting...")
-            sys.exit(1)
 
 
 def signal_handler(sig, frame):
@@ -287,116 +264,6 @@ async def build_chunks(task, progress_callback):
             progress_callback(-1, "Get file from minio: %s" % str(e).replace("'", ""))
         logging.exception("Chunking {}/{} got exception".format(task["location"], task["name"]))
         raise
-    
-    # Add file integrity check before parsing
-    def check_file_integrity(file_name, file_binary):
-        """
-        Check if the file is valid and not corrupted
-        """
-        import io
-        import zipfile
-        
-        # Check file size
-        if len(file_binary) == 0:
-            error_msg = f"File {file_name} is empty"
-            logging.error(error_msg)
-            return False
-        
-        if len(file_binary) < 1024:  # Minimum file size check (1KB)
-            logging.warning(f"File {file_name} is very small ({len(file_binary)} bytes), checking integrity carefully")
-        
-        file_ext = os.path.splitext(file_name)[1].lower()
-        
-        try:
-            if file_ext in [".pdf"]:
-                # Check PDF file integrity
-                from PyPDF2 import PdfReader
-                pdf_reader = PdfReader(io.BytesIO(file_binary))
-                num_pages = len(pdf_reader.pages)
-                if num_pages == 0:
-                    error_msg = f"PDF file {file_name} has no pages"
-                    logging.error(error_msg)
-                    return False
-                logging.info(f"Valid PDF file with {num_pages} pages")
-                
-            elif file_ext in [".xlsx", ".xls"]:
-                # Check Excel file integrity
-                import openpyxl
-                # For xlsx files, check if it's a valid zip file first
-                if file_ext == ".xlsx":
-                    try:
-                        with zipfile.ZipFile(io.BytesIO(file_binary)) as zf:
-                            # Check for required Excel file structure
-                            if '[Content_Types].xml' not in zf.namelist():
-                                raise Exception("Missing required Excel file structure")
-                    except zipfile.BadZipFile:
-                        raise Exception("Not a valid ZIP file (corrupted Excel file)")
-                
-                workbook = openpyxl.load_workbook(io.BytesIO(file_binary), data_only=True)
-                sheet_names = workbook.sheetnames
-                if not sheet_names:
-                    error_msg = f"Excel file {file_name} has no sheets"
-                    logging.error(error_msg)
-                    return False
-                logging.info(f"Valid Excel file with {len(sheet_names)} sheets")
-                
-            elif file_ext in [".docx", ".doc"]:
-                # Check Word file integrity
-                import docx
-                # For docx files, check if it's a valid zip file first
-                if file_ext == ".docx":
-                    try:
-                        with zipfile.ZipFile(io.BytesIO(file_binary)) as zf:
-                            # Check for required Word file structure
-                            if 'word/document.xml' not in zf.namelist():
-                                raise Exception("Missing required Word file structure")
-                    except zipfile.BadZipFile:
-                        raise Exception("Not a valid ZIP file (corrupted Word file)")
-                
-                doc = docx.Document(io.BytesIO(file_binary))
-                paragraphs = len(doc.paragraphs)
-                logging.info(f"Valid Word file with {paragraphs} paragraphs")
-                
-            elif file_ext in [".csv"]:
-                # Check CSV file integrity
-                import csv
-                csv_content = file_binary.decode('utf-8', errors='replace')
-                if not csv_content.strip():
-                    error_msg = f"CSV file {file_name} is empty or contains only whitespace"
-                    logging.error(error_msg)
-                    return False
-                reader = csv.reader(csv_content.splitlines())
-                rows = list(reader)
-                if not rows:
-                    error_msg = f"CSV file {file_name} has no rows"
-                    logging.error(error_msg)
-                    return False
-                logging.info(f"Valid CSV file with {len(rows)} rows")
-                
-            elif file_ext in [".txt"]:
-                # Check text file integrity
-                text_content = file_binary.decode('utf-8', errors='replace')
-                if not text_content.strip():
-                    error_msg = f"Text file {file_name} is empty or contains only whitespace"
-                    logging.error(error_msg)
-                    return False
-                logging.info(f"Valid text file with {len(text_content.splitlines())} lines")
-                
-            # Add more file types as needed
-            
-            return True
-            
-        except Exception as e:
-            error_msg = f"File integrity check failed for {file_name}: {str(e)}"
-            logging.error(error_msg)
-            return False
-    
-    # Perform file integrity check
-    if not check_file_integrity(task["name"], binary):
-        error_message = f"File {task['name']} is corrupted or invalid. Please upload a valid file."
-        progress_callback(-1, error_message)
-        logging.error(error_message)
-        raise Exception(error_message)
 
     try:
         async with chunk_limiter:
@@ -432,37 +299,6 @@ async def build_chunks(task, progress_callback):
     @timeout(60)
     async def upload_to_minio(document, chunk):
         try:
-            # Filter gibberish before uploading
-            content = chunk.get("content", "").strip()
-            content_with_weight = chunk.get("content_with_weight", "").strip()
-            
-            # Check if chunk contains only gibberish
-            if content:
-                if is_gibberish(content):
-                    logging.debug(f"Filtered gibberish chunk during upload: {content[:100]}...")
-                    return
-                # Filter gibberish content
-                filtered_content = filter_gibberish(content)
-                if not filtered_content:
-                    logging.debug(f"Filtered empty chunk after gibberish removal: {content[:100]}...")
-                    return
-                chunk["content"] = filtered_content
-            elif content_with_weight:
-                if is_gibberish(content_with_weight):
-                    logging.debug(f"Filtered gibberish chunk during upload: {content_with_weight[:100]}...")
-                    return
-                # Filter gibberish content
-                filtered_content = filter_gibberish(content_with_weight)
-                if not filtered_content:
-                    logging.debug(f"Filtered empty chunk after gibberish removal: {content_with_weight[:100]}...")
-                    return
-                chunk["content_with_weight"] = filtered_content
-                if "content" in chunk:
-                    chunk["content"] = filtered_content
-            else:
-                # Skip chunks with no content
-                return
-            
             d = copy.deepcopy(document)
             d.update(chunk)
             d["id"] = xxhash.xxh64(
@@ -481,9 +317,9 @@ async def build_chunks(task, progress_callback):
                 return
             await image2id(d, partial(settings.STORAGE_IMPL.put, tenant_id=task["tenant_id"]), d["id"], task["kb_id"])
             docs.append(d)
-        except Exception as e:
+        except Exception:
             logging.exception(
-                "Saving image of chunk {}/{}/{} got exception: {}".format(task["location"], task["name"], d.get("id", "unknown"), e))
+                "Saving image of chunk {}/{}/{} got exception".format(task["location"], task["name"], d["id"]))
             raise
 
     tasks = []
@@ -754,30 +590,7 @@ async def embedding(docs, mdl, parser_config=None, callback=None):
     @timeout(60)
     def batch_encode(txts):
         nonlocal mdl
-        from common.token_utils import num_tokens_from_string
-        # Use a safe truncation value to avoid token length errors
-        max_token_length = min(mdl.max_length, 8191)
-        logging.info(f"Batch encode: processing {len(txts)} texts, max token length: {max_token_length}")
-        
-        # Truncate each text and check token length
-        truncated_texts = []
-        for i, c in enumerate(txts):
-            # First truncate based on character count
-            truncated = truncate(c, max_token_length)
-            # Then check actual token count
-            token_count = num_tokens_from_string(truncated)
-            
-            # If still too long, truncate more aggressively
-            if token_count > max_token_length:
-                # Try with 80% of max length
-                more_truncated = truncate(c, int(max_token_length * 0.8))
-                token_count = num_tokens_from_string(more_truncated)
-                logging.info(f"Text {i}: still too long, further truncated to {token_count} tokens")
-                truncated = more_truncated
-            
-            truncated_texts.append(truncated)
-        
-        return mdl.encode(truncated_texts)
+        return mdl.encode([truncate(c, mdl.max_length - 10) for c in txts])
 
     cnts_ = np.array([])
     for i in range(0, len(cnts), settings.EMBEDDING_BATCH_SIZE):
@@ -856,8 +669,6 @@ async def run_dataflow(task: dict):
             e, kb = KnowledgebaseService.get_by_id(task["kb_id"])
             embedding_id = kb.embd_id
             embedding_model = LLMBundle(task["tenant_id"], LLMType.EMBEDDING, llm_name=embedding_id)
-            # 包装为缓存嵌入模型
-            embedding_model = CachedEmbed(embedding_model)
 
             @timeout(60)
             def batch_encode(txts):
@@ -1010,15 +821,15 @@ async def run_raptor_for_kb(row, kb_parser_config, chat_mdl, embd_mdl, vector_si
                     logging.warning(f"RAPTOR: Chunk missing vector field '{vctr_nm}' in doc {doc_id}, skipping")
                     continue
                 chunks.append((d["content_with_weight"], np.array(d[vctr_nm])))
-            
+
             if skipped_chunks > 0:
                 callback(msg=f"[WARN] Skipped {skipped_chunks} chunks without vector field '{vctr_nm}' for doc {doc_id}. Consider re-parsing the document with the current embedding model.")
-            
+
             if not chunks:
                 logging.warning(f"RAPTOR: No valid chunks with vectors found for doc {doc_id}")
                 callback(msg=f"[WARN] No valid chunks with vectors found for doc {doc_id}, skipping")
                 continue
-                
+
             await generate(chunks, doc_id)
             callback(prog=(x + 1.) / len(doc_ids))
     else:
@@ -1071,11 +882,11 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
     # Process chunks in batches to reduce memory usage
     batch_size = settings.DOC_BULK_SIZE
     total_chunks = len(chunks)
-    
+
     # First, process all chunks to add mom_id
     mother_ids = set([])
     mothers = []
-    
+
     for ck in chunks:
         mom = ck.get("mom") or ck.get("mom_with_weight") or ""
         if not mom:
@@ -1096,23 +907,23 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
             "position_int": ck.get("position_int")
         }
         mothers.append(mom_ck)
-    
+
     # Insert mothers in batches
     for b in range(0, len(mothers), batch_size):
         batch_mothers = mothers[b:b + batch_size]
         await thread_pool_exec(settings.docStoreConn.insert, batch_mothers,
-                                search.index_name(task_tenant_id), task_dataset_id, )
-    
+                               search.index_name(task_tenant_id), task_dataset_id, )
+
     # Clear mothers list to free memory
     del mothers
     del mother_ids
-    
+
     # Insert chunks in batches
     for b in range(0, total_chunks, batch_size):
         batch_chunks = chunks[b:b + batch_size]
         await thread_pool_exec(settings.docStoreConn.insert, batch_chunks,
-                                search.index_name(task_tenant_id), task_dataset_id, )
-        
+                               search.index_name(task_tenant_id), task_dataset_id, )
+
         # Update progress
         if progress_callback:
             progress = 0.7 + 0.2 * (b + len(batch_chunks)) / total_chunks
@@ -1121,7 +932,7 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
         if task_canceled:
             progress_callback(-1, msg="Task has been canceled.")
             return False
-    
+
     # Return True on success
     return True
 
@@ -1285,32 +1096,16 @@ async def do_handle_task(task):
         return
     else:
         # Standard chunking methods
-        import psutil
-        
-        # Check memory usage before processing
-        process = psutil.Process()
-        memory_before = process.memory_info().rss / 1024 / 1024 / 1024
-        logging.info(f"Memory usage before processing {task_document_name}: {memory_before:.2f} GB")
-        
         start_ts = timer()
         chunks = await build_chunks(task, progress_callback)
-        memory_after_build = process.memory_info().rss / 1024 / 1024 / 1024
-        logging.info(f"Build document {task_document_name}: {timer() - start_ts:.2f}s, memory change: {memory_after_build - memory_before:.2f} GB")
-        
+        logging.info("Build document {}: {:.2f}s".format(task_document_name, timer() - start_ts))
         if not chunks:
             progress_callback(1., msg=f"No chunk built from {task_document_name}")
             return
         progress_callback(msg="Generate {} chunks".format(len(chunks)))
-        
-        # Check memory usage before embedding
-        memory_before_embed = process.memory_info().rss / 1024 / 1024 / 1024
-        logging.info(f"Memory usage before embedding: {memory_before_embed:.2f} GB")
-        
         start_ts = timer()
         try:
             token_count, vector_size = await embedding(chunks, embedding_model, task_parser_config, progress_callback)
-            memory_after_embed = process.memory_info().rss / 1024 / 1024 / 1024
-            logging.info(f"Embedding chunks: {timer() - start_ts:.2f}s, memory change: {memory_after_embed - memory_before_embed:.2f} GB")
         except Exception as e:
             error_message = "Generate embedding error:{}".format(str(e))
             progress_callback(-1, error_message)
@@ -1407,18 +1202,10 @@ async def handle_task():
         FAILED_TASKS += 1
         CURRENT_TASKS.pop(task_id, None)
         try:
-            # Get detailed error information
-            import traceback
-            err_traceback = traceback.format_exc()
             err_msg = str(e)
             while isinstance(e, exceptiongroup.ExceptionGroup):
                 e = e.exceptions[0]
                 err_msg += ' -- ' + str(e)
-            # Check memory usage when a task fails
-            check_memory_usage()
-            # Log detailed error information
-            logging.error(f"handle_task detailed exception for task {task['id']}, doc_id: {task['doc_id']}, name: {task['name']}:\n{err_traceback}")
-            # Update task progress with error information
             set_progress(task_id, prog=-1, msg=f"[Exception]: {err_msg}")
         except Exception as e:
             logging.exception(f"[Exception]: {str(e)}")

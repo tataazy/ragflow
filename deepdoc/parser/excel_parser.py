@@ -20,7 +20,6 @@ import pandas as pd
 from openpyxl import Workbook, load_workbook
 from PIL import Image
 
-from common.text_quality import is_gibberish, filter_gibberish
 from rag.nlp import find_codec
 
 # copied from `/openpyxl/cell/cell.py`
@@ -77,12 +76,11 @@ class RAGFlowExcelParser:
             # Handle case where df is a dict of DataFrames (multiple sheets)
             for sheet_name, sheet_df in df.items():
                 if isinstance(sheet_df, pd.DataFrame):
-                    # 使用向量化操作替代apply，提升性能
-                    df[sheet_name] = sheet_df.applymap(clean_string)
+                    df[sheet_name] = sheet_df.apply(lambda col: col.map(clean_string))
             return df
         elif isinstance(df, pd.DataFrame):
             # Handle case where df is a single DataFrame
-            return df.applymap(clean_string)
+            return df.apply(lambda col: col.map(clean_string))
         else:
             # Return as-is if not a DataFrame or dict
             return df
@@ -91,7 +89,7 @@ class RAGFlowExcelParser:
     def _dataframe_to_workbook(df):
         # Clean the dataframe first
         cleaned_df = RAGFlowExcelParser._clean_dataframe(df)
-        
+
         # Handle dict case (multiple sheets)
         if isinstance(cleaned_df, dict):
             if len(cleaned_df) > 1:
@@ -117,13 +115,13 @@ class RAGFlowExcelParser:
                 ws.cell(row=row_num, column=col_num, value=value)
 
         return wb
-    
+
     @staticmethod
     def _dataframes_to_workbook(dfs: dict):
         wb = Workbook()
         default_sheet = wb.active
         wb.remove(default_sheet)
-        
+
         for sheet_name, df in dfs.items():
             df = RAGFlowExcelParser._clean_dataframe(df)
             ws = wb.create_sheet(title=sheet_name)
@@ -149,23 +147,8 @@ class RAGFlowExcelParser:
 
         for img in images:
             try:
-                # 限制处理的图片数量，避免内存溢出
-                if len(raw_items) >= 20:
-                    logging.warning(f"Too many images in worksheet {sheetname}, limiting to 20 images")
-                    break
-                
                 img_bytes = img._data()
-                # 限制图片大小，避免处理过大的图片
-                if len(img_bytes) > 10 * 1024 * 1024:  # 10MB
-                    logging.warning(f"Image too large ({len(img_bytes)/1024/1024:.2f}MB), skipping")
-                    continue
-                
                 pil_img = Image.open(BytesIO(img_bytes)).convert("RGB")
-                
-                # 调整图片大小，减少内存使用
-                max_size = 1024
-                if pil_img.width > max_size or pil_img.height > max_size:
-                    pil_img.thumbnail((max_size, max_size))
 
                 anchor = img.anchor
                 if hasattr(anchor, "_from") and hasattr(anchor, "_to"):
@@ -191,32 +174,15 @@ class RAGFlowExcelParser:
                     "span_type": span,
                 }
                 raw_items.append(item)
-            except Exception as e:
-                logging.warning(f"Error extracting image: {e}")
+            except Exception:
                 continue
         return raw_items
 
     def html(self, fnm, chunk_rows=256):
-        import gc
-        import psutil
-        from timeit import default_timer as timer
-        
         from html import escape
 
         file_like_object = BytesIO(fnm) if not isinstance(fnm, str) else fnm
-        
-        # Log file size
-        if isinstance(fnm, bytes):
-            logging.info(f"Excel file size: {len(fnm)/1024/1024:.2f} MB")
-        
-        # Load Excel workbook
-        st = timer()
         wb = RAGFlowExcelParser._load_excel_to_workbook(file_like_object)
-        logging.info(f"Excel workbook loaded in {timer() - st:.2f}s")
-        
-        # Log number of sheets
-        logging.info(f"Number of sheets: {len(wb.sheetnames)}")
-        
         tb_chunks = []
 
         def _fmt(v):
@@ -225,94 +191,35 @@ class RAGFlowExcelParser:
             return str(v).strip()
 
         for sheetname in wb.sheetnames:
-            logging.info(f"Processing sheet: {sheetname}")
             ws = wb[sheetname]
-            
-            # Check memory usage
-            process = psutil.Process()
-            memory_usage = process.memory_info().rss / 1024 / 1024 /.1024
-            logging.info(f"Memory usage before processing sheet {sheetname}: {memory_usage:.2f} GB")
-            
             try:
-                # Get header row without loading all rows
-                header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=False))
-                logging.info(f"Header row found with {len(header_row)} columns")
-                
-                tb_rows_0 = "<tr>"
-                for t in header_row:
-                    tb_rows_0 += f"<th>{escape(_fmt(t.value))}</th>"
-                tb_rows_0 += "</tr>"
-                
-                # Process data rows in chunks using iter_rows
-                row_count = ws.max_row
-                logging.info(f"Sheet {sheetname} has {row_count} rows")
-                
-                if row_count <= 1:
-                    logging.info(f"Sheet {sheetname} has no data rows, skipping")
-                    continue
-                
-                # Extract images from worksheet
-                st_img = timer()
-                images = self._extract_images_from_worksheet(ws, sheetname)
-                if images:
-                    logging.info(f"Extracted {len(images)} images from sheet {sheetname} in {timer() - st_img:.2f}s")
-                
-                # Process data rows in chunks
-                st_data = timer()
-                for chunk_start in range(2, row_count + 1, chunk_rows):
-                    chunk_end = min(chunk_start + chunk_rows - 1, row_count)
-                    #logging.info(f"Processing rows {chunk_start} to {chunk_end} in sheet {sheetname}")
-                    
-                    tb = ""
-                    tb += f"<table><caption>{sheetname}</caption>"
-                    tb += tb_rows_0
-                    
-                    # Iterate over the current chunk only
-                    for r in ws.iter_rows(min_row=chunk_start, max_row=chunk_end, values_only=False):
-                        tb += "<tr>"
-                        for i, c in enumerate(r):
-                            if i < len(header_row):
-                                if c.value is None:
-                                    tb += "<td></td>"
-                                else:
-                                    tb += f"<td>{escape(_fmt(c.value))}</td>"
-                            else:
-                                tb += "<td></td>"
-                        tb += "</tr>"
-                    tb += "</table>\n"
-                    tb_chunks.append(tb)
-                    
-                    # 每处理完一个chunk就进行垃圾回收，减少内存占用
-                    if len(tb_chunks) % 10 == 0:
-                        gc.collect()
-                        
-                logging.info(f"Processed data rows in sheet {sheetname} in {timer() - st_data:.2f}s")
-                
-                # Add image references to chunks
-                if images:
-                    for img in images:
-                        img_desc = f"Image in {img['sheet']} at position ({img['row_from']},{img['col_from']})"
-                        tb_chunks.append(f"<div>{img_desc}</div>\n")
-                
-                # Check memory usage after processing sheet
-                # memory_usage_after = process.memory_info().rss / 1024 / 1024 / 1024
-                # logging.info(f"Memory usage after processing sheet {sheetname}: {memory_usage_after:.2f} GB")
-                # logging.info(f"Memory change: {memory_usage_after - memory_usage:.2f} GB")
-                
-                # Clean up after processing each sheet
-                # gc.collect()
-                # memory_usage_after_gc = process.memory_info().rss / 1024 / 1024 / 1024
-                # logging.info(f"Memory usage after GC: {memory_usage_after_gc:.2f} GB")
-                    
+                rows = list(ws.rows)
             except Exception as e:
                 logging.warning(f"Skip sheet '{sheetname}' due to rows access error: {e}")
                 continue
-        
-        # Final memory check
-        # process = psutil.Process()
-        # final_memory_usage = process.memory_info().rss / 1024 / 1024 / 1024
-        # logging.info(f"Final memory usage after parsing Excel: {final_memory_usage:.2f} GB")
-        logging.info(f"Total tb_chunks processed: {len(tb_chunks)}")
+
+            if not rows:
+                continue
+
+            tb_rows_0 = "<tr>"
+            for t in list(rows[0]):
+                tb_rows_0 += f"<th>{escape(_fmt(t.value))}</th>"
+            tb_rows_0 += "</tr>"
+
+            for chunk_i in range((len(rows) - 1) // chunk_rows + 1):
+                tb = ""
+                tb += f"<table><caption>{sheetname}</caption>"
+                tb += tb_rows_0
+                for r in list(rows[1 + chunk_i * chunk_rows : min(1 + (chunk_i + 1) * chunk_rows, len(rows))]):
+                    tb += "<tr>"
+                    for i, c in enumerate(r):
+                        if c.value is None:
+                            tb += "<td></td>"
+                        else:
+                            tb += f"<td>{escape(_fmt(c.value))}</td>"
+                    tb += "</tr>"
+                tb += "</table>\n"
+                tb_chunks.append(tb)
 
         return tb_chunks
 
@@ -331,133 +238,32 @@ class RAGFlowExcelParser:
         return df.to_markdown(index=False)
 
     def __call__(self, fnm):
-        import gc
-        import psutil
-        from timeit import default_timer as timer
-        
         file_like_object = BytesIO(fnm) if not isinstance(fnm, str) else fnm
-        
-        # Log file size
-        if isinstance(fnm, bytes):
-            logging.info(f"Excel file size: {len(fnm)/1024/1024:.2f} MB")
-        
-        # Load Excel workbook
-        st = timer()
         wb = RAGFlowExcelParser._load_excel_to_workbook(file_like_object)
-        logging.info(f"Excel workbook loaded in {timer() - st:.2f}s")
-        
-        # Log number of sheets
-        logging.info(f"Number of sheets: {len(wb.sheetnames)}")
-        
-        res = []
-        process = psutil.Process()
-        
-        for sheetname in wb.sheetnames:
-            logging.info(f"Processing sheet: {sheetname}")
-            ws = wb[sheetname]
-            
-            # Check memory usage
-            memory_usage = process.memory_info().rss / 1024 / 1024 / 1024
-            logging.info(f"Memory usage before processing sheet {sheetname}: {memory_usage:.2f} GB")
-            
-            try:
-                # Get header row without loading all rows
-                header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=False))
-                logging.info(f"Header row found with {len(header_row)} columns")
-                ti = [str(t.value) if t.value else "" for t in header_row]
-                
-                # Process data rows using iter_rows
-                row_count = ws.max_row
-                logging.info(f"Sheet {sheetname} has {row_count} rows")
-                
-                if row_count <= 1:
-                    logging.info(f"Sheet {sheetname} has no data rows, skipping")
-                    continue
-                
-                # Extract images from worksheet
-                st_img = timer()
-                images = self._extract_images_from_worksheet(ws, sheetname)
-                if images:
-                    logging.info(f"Extracted {len(images)} images from sheet {sheetname} in {timer() - st_img:.2f}s")
 
-                
-                # Process data rows in chunks
-                chunk_size = 1000
-                st_data = timer()
-                rows_processed = 0
-                consecutive_empty_rows = 0
-                max_consecutive_empty_rows = 100  # 当遇到100个连续空行时停止处理
-                
-                for chunk_start in range(2, row_count + 1, chunk_size):
-                    chunk_end = min(chunk_start + chunk_size - 1, row_count)
-                    # logging.info(f"Processing rows {chunk_start} to {chunk_end} in sheet {sheetname}")
-                    
-                    # Iterate over the current chunk only
-                    for r in ws.iter_rows(min_row=chunk_start, max_row=chunk_end, values_only=False):
-                        fields = []
-                        has_data = False
-                        
-                        for i, c in enumerate(r):
-                            if c.value:
-                                has_data = True
-                                if i < len(ti) and ti[i]:
-                                    field = f"{ti[i]}：{c.value}"
-                                else:
-                                    field = str(c.value)
-                                fields.append(field)
-                        
-                        # Check if row has data
-                        if has_data:
-                            consecutive_empty_rows = 0
-                            line = "; ".join(fields)
-                            if sheetname.lower().find("sheet") < 0:
-                                line += " ——" + sheetname
-                            if line:
-                                # Filter gibberish content
-                                if not is_gibberish(line):
-                                    filtered_line = filter_gibberish(line)
-                                    if filtered_line:
-                                        res.append(filtered_line)
-                                        rows_processed += 1
-                                else:
-                                    logging.debug(f"Filtered gibberish row from Excel: {line[:100]}...")
-                                
-                                # Check memory usage every 100 rows
-                                # if rows_processed % 100 == 0:
-                                #     current_memory = process.memory_info().rss / 1024 / 1024 / 1024
-                                #     logging.info(f"Processed {rows_processed} rows, memory usage: {current_memory:.2f} GB")
-                        else:
-                            consecutive_empty_rows += 1
-                            # If we've hit too many consecutive empty rows, stop processing
-                            if consecutive_empty_rows >= max_consecutive_empty_rows:
-                                logging.info(f"Found {consecutive_empty_rows} consecutive empty rows, stopping processing of sheet {sheetname}")
-                                break
-                    
-                    # If we've hit too many consecutive empty rows, stop processing
-                    if consecutive_empty_rows >= max_consecutive_empty_rows:
-                        break
-                
-                logging.info(f"Processed {rows_processed} rows in sheet {sheetname} in {timer() - st_data:.2f}s")
-                
-                # Check memory usage after processing sheet
-                # memory_usage_after = process.memory_info().rss / 1024 / 1024 / 1024
-                # logging.info(f"Memory usage after processing sheet {sheetname}: {memory_usage_after:.2f} GB")
-                # logging.info(f"Memory change: {memory_usage_after - memory_usage:.2f} GB")
-                
-                # Clean up after processing each sheet
-                # gc.collect()
-                # memory_usage_after_gc = process.memory_info().rss / 1024 / 1024 / 1024
-                # logging.info(f"Memory usage after GC: {memory_usage_after_gc:.2f} GB")
-                    
+        res = []
+        for sheetname in wb.sheetnames:
+            ws = wb[sheetname]
+            try:
+                rows = list(ws.rows)
             except Exception as e:
                 logging.warning(f"Skip sheet '{sheetname}' due to rows access error: {e}")
                 continue
-        
-        # Final memory check
-        # final_memory_usage = process.memory_info().rss / 1024 / 1024 / 1024
-        # logging.info(f"Final memory usage after parsing Excel: {final_memory_usage:.2f} GB")
-        logging.info(f"Total rows processed: {len(res)}")
-
+            if not rows:
+                continue
+            ti = list(rows[0])
+            for r in list(rows[1:]):
+                fields = []
+                for i, c in enumerate(r):
+                    if not c.value:
+                        continue
+                    t = str(ti[i].value) if i < len(ti) else ""
+                    t += ("：" if t else "") + str(c.value)
+                    fields.append(t)
+                line = "; ".join(fields)
+                if sheetname.lower().find("sheet") < 0:
+                    line += " ——" + sheetname
+                res.append(line)
         return res
 
     @staticmethod
@@ -465,15 +271,14 @@ class RAGFlowExcelParser:
         if fnm.split(".")[-1].lower().find("xls") >= 0:
             wb = RAGFlowExcelParser._load_excel_to_workbook(BytesIO(binary))
             total = 0
-            
+
             for sheetname in wb.sheetnames:
-               try:
-                   ws = wb[sheetname]
-                   # Use max_row instead of loading all rows to memory
-                   total += ws.max_row
-               except Exception as e:
-                   logging.warning(f"Skip sheet '{sheetname}' due to rows access error: {e}")
-                   continue
+                try:
+                    ws = wb[sheetname]
+                    total += len(list(ws.rows))
+                except Exception as e:
+                    logging.warning(f"Skip sheet '{sheetname}' due to rows access error: {e}")
+                    continue
             return total
 
         if fnm.split(".")[-1].lower() in ["csv", "txt"]:
