@@ -883,12 +883,15 @@ class RAGFlowPdfParser:
             if not text:
                 return False
 
-            # 1. 检测 CID 占位符 (cid:XXX)
+            # 1. 检测 CID 占位符 (cid:XXX) - 更严格的检测
             cid_matches = re.findall(r'\(cid:\d+\)', text)
             cid_count = len(cid_matches)
             cid_ratio = sum(len(m) for m in cid_matches) / len(text) if text else 0
-            # 只要包含CID占位符就认为是乱码(更严格的检测)
-            if cid_count > 0 and cid_ratio > 0.01:  # 超过 1% 的 CID 占位符
+            # 对于CID占位符采用更严格的策略：只要包含就认为是乱码
+            if cid_count > 0:  # 只要有CID占位符就判定为乱码
+                return True
+            # 备用阈值检测（针对非CID但类似的乱码模式）
+            if cid_ratio > 0.01:  # 超过 1% 的 CID 占位符
                 return True
 
             # 2. 检测私有区 Unicode 字符（字体缺失的乱码）
@@ -1663,8 +1666,6 @@ class RAGFlowPdfParser:
         self._text_merge()
         self._concat_downward()
         self._filter_forpages()
-        # 新增：过滤乱码
-        self._filter_gibberish_boxes(min_length=5)
         tbls = self._extract_table_figure(need_image, zoomin, return_html, False)
         return self.__filterout_scraps(deepcopy(self.boxes), zoomin), tbls
 
@@ -1691,8 +1692,6 @@ class RAGFlowPdfParser:
         self._text_merge()
         self._concat_downward()
         self._naive_vertical_merge(zoomin)
-        # 新增：过滤乱码
-        self._filter_gibberish_boxes(min_length=5)
         if callback:
             callback(0.92, "Text merged ({:.2f}s)".format(timer() - start))
 

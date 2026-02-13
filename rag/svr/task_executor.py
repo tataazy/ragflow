@@ -306,6 +306,37 @@ async def build_chunks(task, progress_callback):
         logging.exception("Chunking {}/{} got exception".format(task["location"], task["name"]))
         raise
 
+    # 在chunk处理前进行二次乱码检测和过滤（仅对PDF文件）
+    from common.text_quality import is_gibberish, filter_gibberish
+    
+    # 只对PDF文件进行乱码检测，避免影响Excel等其他文件类型
+    is_pdf_file = task["name"].lower().endswith('.pdf') if task.get("name") else False
+    
+    if is_pdf_file:
+        # 过滤掉明显包含乱码的chunks
+        filtered_cks = []
+        removed_count = 0
+        for ck in cks:
+            content = ck.get("content_with_weight", "")
+            if content and not is_gibberish(content, threshold=0.25):  # 使用较低阈值进行严格检测
+                # 进一步清理内容
+                cleaned_content = filter_gibberish(content, min_length=10)
+                if cleaned_content and len(cleaned_content.strip()) >= 10:
+                    ck["content_with_weight"] = cleaned_content.strip()
+                    filtered_cks.append(ck)
+                else:
+                    removed_count += 1
+            else:
+                removed_count += 1
+        
+        if removed_count > 0:
+            logging.info(f"Removed {removed_count} chunks containing gibberish from {task['name']}")
+            progress_callback(msg=f"Filtered out {removed_count} chunks with乱码 content")
+        
+        cks = filtered_cks
+    else:
+        logging.debug(f"Skipping gibberish detection for non-PDF file: {task['name']}")
+    
     docs = []
     doc = {
         "doc_id": task["doc_id"],

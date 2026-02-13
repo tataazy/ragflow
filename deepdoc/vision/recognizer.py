@@ -407,7 +407,7 @@ class Recognizer:
         } for i in indices]
 
     def close(self):
-        logging.info("Close recognizer.")
+        logging.debug("Close recognizer.")
         if hasattr(self, "ort_sess"):
             del self.ort_sess
         gc.collect()

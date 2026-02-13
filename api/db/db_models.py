@@ -251,7 +251,7 @@ class RetryingPooledMySQLDatabase(PooledMySQLDatabase):
                 return super().execute_sql(sql, params, commit)
             except (OperationalError, InterfaceError, ValueError) as e:
                 error_codes = [2013, 2006]
-                error_messages = ['', 'Lost connection', 'read of closed file']
+                error_messages = ['Lost connection', 'read of closed file']
                 
                 # 提取错误信息
                 error_args = getattr(e, 'args', [])
@@ -301,7 +301,7 @@ class RetryingPooledMySQLDatabase(PooledMySQLDatabase):
                 return super().begin()
             except (OperationalError, InterfaceError) as e:
                 error_codes = [2013, 2006]
-                error_messages = ['', 'Lost connection']
+                error_messages = ['Lost connection']
 
                 should_retry = (
                     (hasattr(e, 'args') and e.args and e.args[0] in error_codes) or
