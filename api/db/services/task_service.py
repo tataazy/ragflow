@@ -26,7 +26,6 @@ from api.db.db_models import DB, File2Document, File
 from api.db import FileType
 from api.db.db_models import Task, Document, Knowledgebase, Tenant
 from api.db.services.common_service import CommonService
-from api.db.services.document_service import DocumentService
 from common.misc_utils import get_uuid
 from common.time_utils import current_timestamp
 from common.constants import StatusEnum, TaskStatus
@@ -289,6 +288,7 @@ class TaskService(CommonService):
         Returns:
             bool: True if the task should be cancelled, False otherwise.
         """
+        from api.db.services.document_service import DocumentService
         task = cls.model.get_by_id(id)
         _, doc = DocumentService.get_by_id(task.doc_id)
         return doc.run == TaskStatus.CANCEL.value or doc.progress < 0
@@ -377,6 +377,7 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
         - Task digests are calculated for optimization and reuse
         - Previous task chunks may be reused if available
     """
+    from api.db.services.document_service import DocumentService
 
     def new_task():
         return {
@@ -454,14 +455,36 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
                                          chunking_config["kb_id"])
     DocumentService.update_by_id(doc["id"], {"chunk_num": ck_num})
 
+    # Step 1: Insert tasks to DB (but not update status yet)
     bulk_insert_into_db(Task, parse_task_array, True)
-    DocumentService.begin2parse(doc["id"])
 
+    # Step 2: Send messages to Redis FIRST
+    # This ensures messages are queued before marking as "parsing"
     unfinished_task_array = [task for task in parse_task_array if task["progress"] < 1.0]
+    failed_tasks = []
     for unfinished_task in unfinished_task_array:
-        assert REDIS_CONN.queue_product(
-            settings.get_svr_queue_name(priority), message=unfinished_task
-        ), "Can't access Redis. Please check the Redis' status."
+        try:
+            success = REDIS_CONN.queue_product(
+                settings.get_svr_queue_name(priority), message=unfinished_task
+            )
+            if not success:
+                failed_tasks.append(unfinished_task["id"])
+                logging.error(f"Failed to queue task {unfinished_task['id']} to Redis")
+        except Exception as e:
+            failed_tasks.append(unfinished_task["id"])
+            logging.exception(f"Exception when queueing task {unfinished_task['id']}: {e}")
+
+    # Step 3: Update status ONLY for successfully queued tasks
+    if failed_tasks:
+        logging.warning(f"Some tasks failed to queue: {failed_tasks}")
+        # Delete failed tasks from DB
+        TaskService.filter_delete([Task.id.in_(failed_tasks)])
+        # Revert chunk_num update
+        DocumentService.update_by_id(doc["id"], {"chunk_num": 0})
+        raise Exception(f"Failed to queue {len(failed_tasks)} tasks to Redis. Please check Redis status.")
+
+    # Only update status after all messages successfully queued
+    DocumentService.begin2parse(doc["id"])
 
 
 def reuse_prev_task_chunks(task: dict, prev_tasks: list[dict], chunking_config: dict):
@@ -530,6 +553,7 @@ def has_canceled(task_id):
 
 
 def queue_dataflow(tenant_id:str, flow_id:str, task_id:str, doc_id:str=CANVAS_DEBUG_DOC_ID, file:dict=None, priority: int=0, rerun:bool=False) -> tuple[bool, str]:
+    from api.db.services.document_service import DocumentService
 
     task = dict(
         id=task_id,
@@ -542,7 +566,6 @@ def queue_dataflow(tenant_id:str, flow_id:str, task_id:str, doc_id:str=CANVAS_DE
     )
     if doc_id not in [CANVAS_DEBUG_DOC_ID, GRAPH_RAPTOR_FAKE_DOC_ID]:
         TaskService.model.delete().where(TaskService.model.doc_id == doc_id).execute()
-        DocumentService.begin2parse(doc_id)
     bulk_insert_into_db(model=Task, data_source=[task], replace_on_conflict=True)
 
     task["kb_id"] = DocumentService.get_knowledgebase_id(doc_id)
@@ -550,9 +573,16 @@ def queue_dataflow(tenant_id:str, flow_id:str, task_id:str, doc_id:str=CANVAS_DE
     task["dataflow_id"] = flow_id
     task["file"] = file
 
+    # Send to Redis FIRST, then update status
     if not REDIS_CONN.queue_product(
             settings.get_svr_queue_name(priority), message=task
     ):
+        # Clean up on failure
+        TaskService.filter_delete([Task.id == task_id])
         return False, "Can't access Redis. Please check the Redis' status."
+
+    # Only update status after successful queue
+    if doc_id not in [CANVAS_DEBUG_DOC_ID, GRAPH_RAPTOR_FAKE_DOC_ID]:
+        DocumentService.begin2parse(doc_id)
 
     return True, ""

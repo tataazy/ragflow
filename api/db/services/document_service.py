@@ -1148,6 +1148,8 @@ def queue_raptor_o_graphrag_tasks(sample_doc_id, ty, priority, fake_doc_id="", d
     You can provide a fake_doc_id to bypass the restriction of tasks at the knowledgebase level.
     Optionally, specify a list of doc_ids to determine which documents participate in the task.
     """
+    from api.db.services.task_service import TaskService
+    from api.db.services.document_service import DocumentService
     assert ty in ["graphrag", "raptor", "mindmap"], "type should be graphrag, raptor or mindmap"
 
     chunking_config = DocumentService.get_chunking_config(sample_doc_id["id"])
@@ -1176,8 +1178,15 @@ def queue_raptor_o_graphrag_tasks(sample_doc_id, ty, priority, fake_doc_id="", d
 
     task["doc_id"] = fake_doc_id
     task["doc_ids"] = doc_ids
+
+    # Send to Redis FIRST, then update status
+    success = REDIS_CONN.queue_product(settings.get_svr_queue_name(priority), message=task)
+    if not success:
+        # Clean up on failure
+        TaskService.filter_delete([Task.id == task["id"]])
+        raise Exception("Can't access Redis. Please check the Redis' status.")
+
     DocumentService.begin2parse(sample_doc_id["id"], keep_progress=True)
-    assert REDIS_CONN.queue_product(settings.get_svr_queue_name(priority), message=task), "Can't access Redis. Please check the Redis' status."
     return task["id"]
 
 

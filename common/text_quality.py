@@ -19,6 +19,18 @@ import logging
 from collections import Counter
 
 
+# 预编译正则表达式以提高性能
+VOWELS_PATTERN = re.compile(r'[AEIOU]')
+CONSONANT_CLUSTERS_PATTERN = re.compile(r'[BCDFGHJKLMNPQRSTVWXZ]{4,}')
+MIXED_DIGIT_LETTER_PATTERN = re.compile(r'[0-9]+[A-Z]+[0-9]+')
+
+# 常见双字母组合集合
+COMMON_BIGRAMS = {'TH', 'HE', 'IN', 'ER', 'AN', 'RE', 'ON', 'AT', 'EN', 'ND', 
+                  'TI', 'ES', 'OR', 'TE', 'OF', 'ED', 'IS', 'IT', 'AL', 'AR',
+                  'ST', 'TO', 'NT', 'EA', 'NG', 'AS', 'OU', 'SE', 'HA', 'ND'}
+
+
+
 def _is_pseudo_english_gibberish(text):
     """
     检测"伪英文乱码" - 看起来像英文单词但实际是随机字符组合
@@ -28,6 +40,11 @@ def _is_pseudo_english_gibberish(text):
         bool: 是否为伪英文乱码
     """
     if not text or len(text) < 10:
+        return False
+    
+    # 快速检查：是否包含足够的字母
+    has_letters = any(c.isalpha() for c in text)
+    if not has_letters:
         return False
     
     # 只检查包含字母的文本
@@ -41,49 +58,61 @@ def _is_pseudo_english_gibberish(text):
         return False
     
     # 1. 检测辅音群比例（英文中连续的辅音通常不超过3个）
-    consonant_clusters = re.findall(r'[BCDFGHJKLMNPQRSTVWXZ]{4,}', all_letters)
-    if consonant_clusters:
+    if CONSONANT_CLUSTERS_PATTERN.search(all_letters):
         # 有超过4个连续辅音，可能是乱码
         return True
     
     # 2. 检测元音比例（英文中元音占比约40%）
-    vowels = re.findall(r'[AEIOU]', all_letters)
-    vowel_ratio = len(vowels) / len(all_letters) if all_letters else 0
+    vowel_count = len(VOWELS_PATTERN.findall(all_letters))
+    vowel_ratio = vowel_count / len(all_letters) if all_letters else 0
     
     # 元音比例异常低或高，可能是乱码
     if vowel_ratio < 0.15 or vowel_ratio > 0.6:
         return True
     
     # 3. 检测常见双字母组合（bigrams）比例
-    # 英文中某些字母组合很常见（如TH, HE, IN, ER等）
-    common_bigrams = {'TH', 'HE', 'IN', 'ER', 'AN', 'RE', 'ON', 'AT', 'EN', 'ND', 
-                      'TI', 'ES', 'OR', 'TE', 'OF', 'ED', 'IS', 'IT', 'AL', 'AR',
-                      'ST', 'TO', 'NT', 'EA', 'NG', 'AS', 'OU', 'SE', 'HA', 'ND'}
-    
     bigram_count = 0
-    for i in range(len(all_letters) - 1):
-        if all_letters[i:i+2] in common_bigrams:
-            bigram_count += 1
-    
-    bigram_ratio = bigram_count / (len(all_letters) - 1) if len(all_letters) > 1 else 0
-    
-    # 常见字母组合比例过低，可能是乱码
-    # 英文中常见bigram比例通常在0.3-0.5之间
-    if bigram_ratio < 0.15:
-        return True
+    total_bigrams = len(all_letters) - 1
+    if total_bigrams > 0:
+        for i in range(total_bigrams):
+            if all_letters[i:i+2] in COMMON_BIGRAMS:
+                bigram_count += 1
+        
+        bigram_ratio = bigram_count / total_bigrams
+        
+        # 常见字母组合比例过低，可能是乱码
+        if bigram_ratio < 0.15:
+            return True
     
     # 4. 检测连续数字和字母混合模式
-    # 乱码中常出现数字和字母不规则混合
-    mixed_pattern = re.findall(r'[0-9]+[A-Z]+[0-9]+', all_letters)
+    mixed_pattern = MIXED_DIGIT_LETTER_PATTERN.findall(all_letters)
     if len(mixed_pattern) > 2:
         return True
     
     return False
 
 
+# 预编译正则表达式以提高性能
+CID_PLACEHOLDER_PATTERN = re.compile(r'\(cid:\d+\)')
+REPLACEMENT_CHAR_PATTERN = re.compile(r'[\ufffd\ue000]')
+CHINESE_CHAR_PATTERN = re.compile(r'[\u4e00-\u9fa5]')
+SPECIAL_CHARS_PATTERN = re.compile(r'[!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?`~]{3,}')
+TECH_TERMS_PATTERN = re.compile(r'\b(API|SDK|URL|HTTP|JSON|XML|SQL|CSS|HTML|PDF)\b', re.IGNORECASE)
+
+# 异常Unicode字符集合，使用集合提高查找速度
+UNUSUAL_UNICODE_CHARS = {0x22, 0x15, 0x6a, 0x9, 0x3f, 0xed, 0x77, 0x38, 0x201c, 0x201d,
+                         0x2018, 0x2019, 0x2026, 0x2014, 0x2013, 0x141, 0x144, 0x14c, 0x157}
+
+# 技术术语集合，用于快速查找
+TECH_TERMS_SET = {'API', 'SDK', 'URL', 'DNA', 'RNA', 'HTTP', 'JSON', 'XML', 'SQL', 'CSS', 'HTML', 'PDF', 'CID', 'ID', 'NO', 'OK', 'US', 'UK', 'EU', 'USA', 'CH', 'JP', 'KR', 'SG', 'AU', 'CA', 'DE', 'FR', 'IT', 'ES', 'NL', 'SE', 'NO', 'DK', 'FI', 'PL', 'CZ', 'HU', 'RO', 'BG', 'HR', 'SI', 'SK', 'EE', 'LV', 'LT', 'MT', 'CY', 'LU', 'BE', 'IE', 'PT', 'GR', 'AT', 'CH', 'LI', 'IS', 'AL', 'MK', 'ME', 'RS', 'BA'}
+
+# 混合乱码模式，使用更简单的模式提高性能
+MIXED_GARBAGE_PATTERN = re.compile(r'[A-Z][a-z]*[&/][A-Z][a-z]*[^a-zA-Z0-9\u4e00-\u9fa5\s]{2,}')
+
+
 def is_gibberish(text, threshold=0.3):
     """
-    检测文本是否为乱码（性能优化版）
+    检测文本是否为乱码（优化版本，提高性能）
 
     Args:
         text: 待检测文本
@@ -95,36 +124,33 @@ def is_gibberish(text, threshold=0.3):
     if not text or len(text) < 10:
         return False
 
-    # 快速路径：纯中文文本或主要为中文的文本
-    chinese_chars = len(re.findall(r'[\u4e00-\u9fa5]', text))
-    total_chars = len(text)
-    chinese_ratio = chinese_chars / total_chars if total_chars > 0 else 0
-    
-    # 如果中文字符占比超过60%，认为是正常中文文本（考虑到标点和英文术语）
-    if chinese_ratio > 0.6 and total_chars > 10:  # 增加长度限制避免极短文本误判
-        return False
-    
-    # 完全由中文和空白字符组成的情况
-    if re.match(r'^[\u4e00-\u9fa5\s]+$', text) and len(text) > 5:
-        return False
-
-    # 检测CID占位符 - 更严格的检测
-    cid_matches = re.findall(r'\(cid:\d+\)', text)
-    if len(cid_matches) > 0:
-        cid_ratio = sum(len(m) for m in cid_matches) / len(text)
-        # 对于CID占位符采用零容忍策略：只要存在就判定为乱码
-        logging.debug(f"Detected CID placeholders: count={len(cid_matches)}, ratio={cid_ratio:.2%}")
+    # 快速路径1：检查替换字符（性能最优）
+    if REPLACEMENT_CHAR_PATTERN.search(text):
         return True
 
-    # 检测伪英文乱码
-    if _is_pseudo_english_gibberish(text):
-        logging.debug(f"Detected pseudo-English gibberish: {text[:100]}...")
-        return True
+    # 快速路径2：检查 CID 占位符
+    if '(cid:' in text:
+        cid_count = text.count('(cid:')
+        if cid_count > 2 or cid_count / len(text) > 0.01:
+            return True
 
-    # 单次遍历统计
+    # 快速路径3：简单长度检查
+    if len(text) > 1000:
+        # 长文本只采样检查
+        text = text[:500] + text[-500:]
+
+    # 快速路径4：纯中文文本直接通过
+    chinese_chars = len(CHINESE_CHAR_PATTERN.findall(text))
+    if chinese_chars > len(text) * 0.3:
+        return False
+
+    # 单次遍历统计多个指标，减少循环次数
     total = len(text)
     ascii_count = 0
     control_count = 0
+    chinese_count = 0
+    unusual_unicode_count = 0
+    non_ascii_in_non_chinese = 0
     char_counter = Counter()
 
     for c in text:
@@ -133,6 +159,12 @@ def is_gibberish(text, threshold=0.3):
             ascii_count += 1
         if code < 32 and c not in '\t\n\r':
             control_count += 1
+        if '\u4e00' <= c <= '\u9fa5':
+            chinese_count += 1
+        if code in UNUSUAL_UNICODE_CHARS:
+            unusual_unicode_count += 1
+        if code >= 128 and not '\u4e00' <= c <= '\u9fa5':
+            non_ascii_in_non_chinese += 1
         char_counter[c] += 1
 
     # 快速失败：控制字符过多
@@ -145,44 +177,41 @@ def is_gibberish(text, threshold=0.3):
         return True
 
     # 特殊字符检查（增强版）
-    special_chars = re.findall(r'[!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?`~]{3,}', text)
+    special_chars = SPECIAL_CHARS_PATTERN.findall(text)
     special_ratio = sum(len(s) for s in special_chars) / total if total > 0 else 0
     
-    # 检测异常Unicode字符
-    unusual_unicode_chars = [0x22, 0x15, 0x6a, 0x9, 0x3f, 0xed, 0x77, 0x38, 0x201c, 0x201d,
-                            0x2018, 0x2019, 0x2026, 0x2014, 0x2013, 0x141, 0x144, 0x14c, 0x157]
-    unusual_unicode_count = sum(1 for c in text if ord(c) in unusual_unicode_chars)
     unusual_unicode_ratio = unusual_unicode_count / total if total > 0 else 0
     
-    # 检测混合乱码模式（如示例中的 DÝ&/gE⁄,ž/›3 这种模式）
-    # 排除正常的技术术语和专业符号
-    tech_terms = r'(API|SDK|URL|DNA|RNA|HTTP|JSON|XML|SQL|CSS|HTML|PDF|CID|ID|NO|OK|US|UK|EU|USA|UK|CH|JP|KR|SG|AU|CA|DE|FR|IT|ES|NL|SE|NO|DK|FI|PL|CZ|HU|RO|BG|HR|SI|SK|EE|LV|LT|MT|CY|LU|BE|IE|PT|GR|AT|CH|LI|IS|AL|MK|ME|RS|BA|HR|SI|SK|EE|LV|LT)'
-    
-    # 更精确的混合乱码检测，排除合法技术术语
-    mixed_garbage_pattern = re.search(r'(?<!\b)(?!' + tech_terms + r'\b)[A-Z][a-z]*[&/][A-Z][a-z]*[^a-zA-Z0-9\u4e00-\u9fa5\s]{2,}', text)
-    has_mixed_garbage = bool(mixed_garbage_pattern)
-    
+    # 快速检查异常Unicode字符比例
     if unusual_unicode_ratio > 0.15:
         logging.debug(f"Detected unusual Unicode characters: {unusual_unicode_ratio:.2%}")
         return True
     
-    # 检测混合乱码模式
-    if has_mixed_garbage:
-        logging.debug(f"Detected mixed garbage pattern: {mixed_garbage_pattern.group()}")
+    # 检测混合乱码模式（简化版本，提高性能）
+    mixed_garbage_match = MIXED_GARBAGE_PATTERN.search(text)
+    if mixed_garbage_match:
+        # 检查是否是合法技术术语
+        match_text = mixed_garbage_match.group()
+        is_tech_term = any(term in match_text.upper() for term in TECH_TERMS_SET)
+        if not is_tech_term:
+            logging.debug(f"Detected mixed garbage pattern: {match_text}")
+            return True
+
+    # 检测伪英文乱码（移到后面，因为计算成本较高）
+    if _is_pseudo_english_gibberish(text):
+        logging.debug(f"Detected pseudo-English gibberish: {text[:100]}...")
         return True
 
     # 综合评分（排除中文干扰）
-    chinese_count = len(re.findall(r'[\u4e00-\u9fa5]', text))
     non_chinese_total = total - chinese_count
 
     if non_chinese_total == 0:
         return False
 
-    non_ascii_in_non_chinese = sum(1 for c in text if ord(c) >= 128 and not '\u4e00' <= c <= '\u9fa5')
     non_ascii_ratio = non_ascii_in_non_chinese / non_chinese_total
 
     # 对于技术文档适当放宽标准
-    tech_indicators = len(re.findall(r'\b(API|SDK|URL|HTTP|JSON|XML|SQL|CSS|HTML|PDF)\b', text, re.IGNORECASE))
+    tech_indicators = len(TECH_TERMS_PATTERN.findall(text))
     if tech_indicators > 0 and total > 50:  # 只对较长的技术文档放宽标准
         # 有技术术语时，稍微提高阈值
         adjusted_threshold = threshold * 1.5
@@ -233,6 +262,10 @@ def contains_gibberish(text, threshold=0.5):
     return gibberish_ratio > threshold
 
 
+# 预编译句子分割正则表达式
+SENTENCE_SPLIT_PATTERN = re.compile(r'([.!?。！？；;\n]+)')
+
+
 def filter_gibberish(text, min_length=5):
     """
     过滤文本中的乱码内容
@@ -248,15 +281,26 @@ def filter_gibberish(text, min_length=5):
         return ""
     
     # 分割文本为句子
-    sentences = re.split(r'([.!?。！？；;\n]+)', text)
+    sentences = SENTENCE_SPLIT_PATTERN.split(text)
     
     # 过滤乱码句子
     filtered_sentences = []
+    
+    # 处理句子和标点符号对
     for i in range(0, len(sentences), 2):
         sentence = sentences[i].strip()
         punctuation = sentences[i+1] if i+1 < len(sentences) else ""
         
-        if sentence and not is_gibberish(sentence) and len(sentence) >= min_length:
+        # 跳过空句子
+        if not sentence:
+            continue
+            
+        # 检查长度阈值（快速检查，避免不必要的乱码检测）
+        if len(sentence) < min_length:
+            continue
+            
+        # 检查是否为乱码
+        if not is_gibberish(sentence):
             filtered_sentences.append(sentence + punctuation)
     
     filtered_text = "".join(filtered_sentences)

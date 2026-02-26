@@ -39,7 +39,6 @@ from sklearn.metrics import silhouette_score
 
 from common.file_utils import get_project_base_directory
 from common.misc_utils import pip_install_torch
-from common.text_quality import is_gibberish, filter_gibberish
 from deepdoc.vision import OCR, AscendLayoutRecognizer, LayoutRecognizer, Recognizer, TableStructureRecognizer
 from rag.nlp import rag_tokenizer
 from rag.prompts.generator import vision_llm_describe_prompt
@@ -290,7 +289,7 @@ class RAGFlowPdfParser:
 
         return best_angle, best_img, results
 
-    def _table_transformer_job(self, ZM, auto_rotate=True):
+    def _table_transformer_job(self, ZM, auto_rotate=False):
         """
         Process table structure recognition.
 
@@ -870,118 +869,6 @@ class RAGFlowPdfParser:
 
         # self.boxes = sorted(merged_boxes, key=lambda x: (x["page_number"], x.get("col_id", 0), x["top"]))
         self.boxes = merged_boxes
-
-    def _filter_gibberish_boxes(self, min_length=5):
-        """
-        过滤乱码文本框并清理文本内容（增强版）
-        """
-        if not self.boxes:
-            return
-
-        def has_cid_or_garbage(text):
-            """检测 CID 占位符和字符级乱码"""
-            if not text:
-                return False
-
-            # 1. 检测 CID 占位符 (cid:XXX) - 更严格的检测
-            cid_matches = re.findall(r'\(cid:\d+\)', text)
-            cid_count = len(cid_matches)
-            cid_ratio = sum(len(m) for m in cid_matches) / len(text) if text else 0
-            # 对于CID占位符采用更严格的策略：只要包含就认为是乱码
-            if cid_count > 0:  # 只要有CID占位符就判定为乱码
-                return True
-            # 备用阈值检测（针对非CID但类似的乱码模式）
-            if cid_ratio > 0.01:  # 超过 1% 的 CID 占位符
-                return True
-
-            # 2. 检测私有区 Unicode 字符（字体缺失的乱码）
-            private_use_count = 0
-            unusual_count = 0
-            valid_ranges = [
-                (0x0020, 0x007E),   # ASCII
-                (0x4E00, 0x9FA5),   # 中文
-                (0x3000, 0x303F),   # 中文标点
-                (0xFF00, 0xFFEF),   # 全角字符
-                (0x2000, 0x206F),   # 通用标点
-            ]
-
-            for c in text:
-                code = ord(c)
-                # 检查是否在有效范围内
-                is_valid = any(start <= code <= end for start, end in valid_ranges)
-                if not is_valid:
-                    # 私有区字符（PUA）
-                    if (0xE000 <= code <= 0xF8FF) or code == 0xFFFD:
-                        private_use_count += 1
-                    # 其他不常见字符
-                    elif code > 127:
-                        unusual_count += 1
-
-            garbage_ratio = (private_use_count * 2 + unusual_count) / len(text) if text else 0
-            if garbage_ratio > 0.15:  # 降低阈值到 15% 的异常字符(更严格)
-                return True
-            
-            # 4. 检测文本中特殊符号的密度
-            special_unicode_count = sum(1 for c in text if ord(c) in [
-                0x22, 0x15, 0x6a, 0x9, 0x3f, 0xed, 0x77, 0x38, 0x201c, 0x201d, 
-                0x2018, 0x2019, 0x2026, 0x2014, 0x2013  # 常见的异常Unicode字符
-            ])
-            if special_unicode_count > len(text) * 0.1:  # 超过10%的特殊符号
-                return True
-
-            return False
-
-        def clean_garbage_chars(text):
-            """清理 CID 和乱码字符"""
-            if not text:
-                return text
-
-            # 移除 CID 占位符
-            text = re.sub(r'\(cid:\d+\)', '', text)
-
-            # 移除或替换私有区字符
-            cleaned = []
-            for c in text:
-                code = ord(c)
-                # 跳过私有区和替换字符
-                if (0xE000 <= code <= 0xF8FF) or code == 0xFFFD or code == 0xEFBFBD:
-                    continue
-                # 替换一些常见的乱码字符为空格
-                elif 0x0080 <= code <= 0x009F:  # C1 控制字符
-                    cleaned.append(' ')
-                else:
-                    cleaned.append(c)
-
-            return ''.join(cleaned)
-
-        filtered = []
-        removed_count = 0
-
-        for b in self.boxes:
-            text = b.get("text", "")
-            if not text:
-                removed_count += 1
-                continue
-
-            # 直接检测 CID 和字符级乱码
-            if has_cid_or_garbage(text):
-                logging.debug(f"Remove CID/garbage box: {text[:80]}...")
-                removed_count += 1
-                continue
-
-            # 清理文本
-            cleaned = clean_garbage_chars(text)
-            cleaned = filter_gibberish(cleaned, min_length=min_length)
-
-            if cleaned.strip() and len(cleaned.strip()) >= min_length:
-                b["text"] = cleaned.strip()
-                filtered.append(b)
-            else:
-                removed_count += 1
-
-        self.boxes = filtered
-        logging.info(f"Gibberish filter: {len(self.boxes)} boxes retained, {removed_count} removed")
-
 
     def _final_reading_order_merge(self, zoomin=3):
         if not self.boxes:
@@ -1653,16 +1540,16 @@ class RAGFlowPdfParser:
             zoomin: Zoom factor
             return_html: Whether to return tables in HTML format
             auto_rotate_tables: Whether to enable auto orientation correction for tables.
-                               None: Use TABLE_AUTO_ROTATE env var setting (default: True)
+                               None: Use TABLE_AUTO_ROTATE env var setting (default: False)
                                True: Enable auto orientation correction
                                False: Disable auto orientation correction
         """
-        if auto_rotate_tables is None:
-            auto_rotate_tables = os.getenv("TABLE_AUTO_ROTATE", "true").lower() in ("true", "1", "yes")
+        # if auto_rotate_tables is None:
+        #     auto_rotate_tables = os.getenv("TABLE_AUTO_ROTATE", "false").lower() in ("true", "1", "yes")
 
         self.__images__(fnm, zoomin)
         self._layouts_rec(zoomin)
-        self._table_transformer_job(zoomin, auto_rotate=auto_rotate_tables)
+        self._table_transformer_job(zoomin, False)
         self._text_merge()
         self._concat_downward()
         self._filter_forpages()
@@ -1681,10 +1568,10 @@ class RAGFlowPdfParser:
             callback(0.63, "Layout analysis ({:.2f}s)".format(timer() - start))
 
         # Read table auto-rotation setting from environment variable
-        auto_rotate_tables = os.getenv("TABLE_AUTO_ROTATE", "true").lower() in ("true", "1", "yes")
+        # auto_rotate_tables = os.getenv("TABLE_AUTO_ROTATE", "false").lower() in ("true", "1", "yes")
 
         start = timer()
-        self._table_transformer_job(zoomin, auto_rotate=auto_rotate_tables)
+        self._table_transformer_job(zoomin, False)
         if callback:
             callback(0.83, "Table analysis ({:.2f}s)".format(timer() - start))
 

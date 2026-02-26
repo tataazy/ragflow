@@ -72,7 +72,7 @@ from rag.app import laws, paper, presentation, manual, qa, table, book, resume, 
 from rag.nlp import search, rag_tokenizer, add_positions
 from rag.raptor import RecursiveAbstractiveProcessing4TreeOrganizedRetrieval as Raptor
 from common.token_utils import num_tokens_from_string, truncate
-from rag.utils.redis_conn import REDIS_CONN, RedisDistributedLock
+from rag.utils.redis_conn import REDIS_CONN, RedisDistributedLock, RedisMsg
 from graphrag.utils import chat_limiter
 from common.signal_utils import start_tracemalloc_and_snapshot, stop_tracemalloc
 from common.exceptions import TaskCanceledException
@@ -189,6 +189,70 @@ def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing...
     except Exception as e:
         logging.exception(f"set_progress({task_id}), progress: {prog}, progress_msg: {msg}, got exception: {e}")
 
+async def claim_stalled_messages(svr_queue_names, idle_time_ms=3600000, batch_size=10):
+    """
+    Claim messages that have been idle for too long from other consumers.
+    This handles the case where task_executor instances died without ACKing messages.
+
+    Args:
+        svr_queue_names: List of queue names to check
+        idle_time_ms: Minimum idle time in milliseconds (default 5 minutes)
+        batch_size: Maximum number of messages to claim
+
+    Returns:
+        RedisMsg if a stalled message was claimed, None otherwise
+    """
+    try:
+        for queue_name in svr_queue_names:
+            try:
+                # Get pending messages with their idle time
+                pending_info = REDIS_CONN.REDIS.xpending_range(
+                    queue_name,
+                    SVR_CONSUMER_GROUP_NAME,
+                    '-',  # min
+                    '+',  # max
+                    batch_size
+                )
+
+                if not pending_info:
+                    continue
+
+                # Find messages that have been idle for too long
+                stalled_ids = []
+                for msg_info in pending_info:
+                    # msg_info is a dict with 'message_id', 'consumer', 'time_since_delivered', 'times_delivered'
+                    idle_ms = msg_info.get('time_since_delivered', 0)
+                    if idle_ms >= idle_time_ms:
+                        stalled_ids.append(msg_info['message_id'])
+
+                if not stalled_ids:
+                    continue
+
+                logging.info(f"Found {len(stalled_ids)} stalled messages in {queue_name} (idle >= {idle_time_ms}ms)")
+
+                # Claim these messages to current consumer
+                claimed = REDIS_CONN.REDIS.xclaim(
+                    queue_name,
+                    SVR_CONSUMER_GROUP_NAME,
+                    CONSUMER_NAME,  # new owner
+                    min_idle_time=idle_time_ms,
+                    message_ids=stalled_ids
+                )
+
+                if claimed:
+                    # Return the first claimed message
+                    msg_id, payload = claimed[0]
+                    logging.info(f"Successfully claimed stalled message {msg_id} from {queue_name}")
+                    return RedisMsg(REDIS_CONN.REDIS, queue_name, SVR_CONSUMER_GROUP_NAME, msg_id, payload)
+
+            except Exception as e:
+                logging.warning(f"Error claiming stalled messages from {queue_name}: {e}")
+                continue
+
+    except Exception as e:
+        logging.exception(f"claim_stalled_messages got exception: {e}")
+
+    return None
 
 async def collect():
     global CONSUMER_NAME, DONE_TASKS, FAILED_TASKS
@@ -197,15 +261,28 @@ async def collect():
     svr_queue_names = settings.get_svr_queue_names()
     redis_msg = None
     try:
+        # Step 1: Try to get current consumer's unacked messages (highest priority)
         if not UNACKED_ITERATOR:
             UNACKED_ITERATOR = REDIS_CONN.get_unacked_iterator(svr_queue_names, SVR_CONSUMER_GROUP_NAME, CONSUMER_NAME)
         try:
             redis_msg = next(UNACKED_ITERATOR)
         except StopIteration:
+            pass
+
+        # Step 2: Consume new messages (normal flow)
+        if not redis_msg:
             for svr_queue_name in svr_queue_names:
                 redis_msg = REDIS_CONN.queue_consumer(svr_queue_name, SVR_CONSUMER_GROUP_NAME, CONSUMER_NAME)
                 if redis_msg:
                     break
+
+        # Step 3: Try to claim stalled messages from other consumers (fallback)
+        # This handles the case where previous task_executor instances died
+        # and left messages in pending state
+        if not redis_msg:
+            redis_msg = await claim_stalled_messages(svr_queue_names, idle_time_ms=600000)  # 1 minute
+            if redis_msg:
+                logging.info(f"Claimed stalled message: {redis_msg.get_msg_id()}")
     except Exception as e:
         logging.exception(f"collect got exception: {e}")
         return None, None
@@ -240,6 +317,24 @@ async def collect():
         logging.warning(f"collect task {msg['id']} {state}")
         redis_msg.ack()
         return None, None
+
+    # Check if task is being processed by current consumer
+    if task["id"] in CURRENT_TASKS:
+        logging.warning(f"Task {msg['id']} is already being processed by this consumer, skipping")
+        redis_msg.ack()
+        return None, None
+
+    # Check if task already completed by querying database
+    # Note: Task model has 'progress' field but no 'run' field (run is in Document table)
+    try:
+        success, task_obj = TaskService.get_by_id(task["id"])
+        if success and task_obj:
+            if task_obj.progress >= 1.0:
+                logging.info(f"Task {msg['id']} already completed in DB (progress={task_obj.progress}), skipping")
+                redis_msg.ack()
+                return None, None
+    except Exception as e:
+        logging.warning(f"Failed to check task {msg['id']} status in DB: {e}")
 
     task_type = msg.get("task_type", "")
     task["task_type"] = task_type
@@ -316,11 +411,14 @@ async def build_chunks(task, progress_callback):
         # 过滤掉明显包含乱码的chunks
         filtered_cks = []
         removed_count = 0
+        st = timer()
         for ck in cks:
             content = ck.get("content_with_weight", "")
-            if content and not is_gibberish(content, threshold=0.25):  # 使用较低阈值进行严格检测
+            #if content:
+            if content and not is_gibberish(content, threshold=0.3):  # 使用较低阈值进行严格检测
                 # 进一步清理内容
                 cleaned_content = filter_gibberish(content, min_length=10)
+                #cleaned_content = content
                 if cleaned_content and len(cleaned_content.strip()) >= 10:
                     ck["content_with_weight"] = cleaned_content.strip()
                     filtered_cks.append(ck)
@@ -329,9 +427,13 @@ async def build_chunks(task, progress_callback):
             else:
                 removed_count += 1
         
+        gibberish_time = timer() - st
         if removed_count > 0:
-            logging.info(f"Removed {removed_count} chunks containing gibberish from {task['name']}")
-            progress_callback(msg=f"Filtered out {removed_count} chunks with乱码 content")
+            logging.info(f"Removed {removed_count} chunks containing gibberish from {task['name']} (time: {gibberish_time:.2f}s)")
+            progress_callback(msg=f"Filtered out {removed_count} chunks with乱码 content (time: {gibberish_time:.2f}s)")
+        else:
+            logging.info(f"No gibberish chunks found in {task['name']} (time: {gibberish_time:.2f}s)")
+            progress_callback(msg=f"Gibberish check completed (time: {gibberish_time:.2f}s)")
         
         cks = filtered_cks
     else:
@@ -1290,8 +1392,12 @@ async def handle_task():
             PipelineOperationLogService.record_pipeline_operation(document_id=task["doc_id"], pipeline_id="",
                                                                   task_type=pipeline_task_type,
                                                                   fake_document_ids=task_document_ids)
-
-    redis_msg.ack()
+        # Ensure message is ACKed regardless of success or failure
+        if redis_msg:
+            try:
+                redis_msg.ack()
+            except Exception as ack_err:
+                logging.warning(f"Failed to ack message for task {task_id}: {ack_err}")
 
 
 async def get_server_ip() -> str:
