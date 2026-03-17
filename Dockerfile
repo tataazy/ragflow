@@ -1,4 +1,4 @@
-# base stage
+# base stage  docker build --platform linux/amd64 -f Dockerfile  --build-arg NEED_MIRROR=1 -t infiniflow/ragflow:nightly .
 FROM ubuntu:24.04 AS base
 USER root
 SHELL ["/bin/bash", "-c"]
@@ -159,11 +159,20 @@ RUN --mount=type=cache,id=ragflow_uv,target=/root/.cache/uv,sharing=locked \
     # Ensure pip is available in the venv for runtime package installation (fixes #12651)
     .venv/bin/python3 -m ensurepip --upgrade
 
+# Copy frontend package files first to leverage Docker layer caching for npm install
+COPY web/package.json web/package-lock.json* ./web/
+RUN --mount=type=cache,id=ragflow_npm,target=/root/.npm,sharing=locked \
+    if [ "$NEED_MIRROR" == "1" ]; then \
+        npm config set registry https://registry.npmmirror.com; \
+    fi; \
+    cd web && npm install
+
+# Copy frontend source code and build (this layer changes when code changes)
 COPY web web
 COPY docs docs
 RUN --mount=type=cache,id=ragflow_npm,target=/root/.npm,sharing=locked \
     export NODE_OPTIONS="--max-old-space-size=4096" && \
-    cd web && npm install && npm run build
+    cd web && npm run build
 
 COPY .git /ragflow/.git
 
