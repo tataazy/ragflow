@@ -133,19 +133,26 @@ class ESConnection(ESConnectionBase):
             for field in highlight_fields:
                 s = s.highlight(field)
 
-        # 排序
+        # 排序 移除：unmapped_type/mode/numeric_type（仅字段未映射时需要，此处字段已正确映射）
+        # if order_by:
+        #     orders = list()
+        #     for field, order in order_by.fields:
+        #         order = "asc" if order == 0 else "desc"
+        #         if field in ["page_num_int", "top_int"]:
+        #             order_info = {"order": order, "unmapped_type": "float",
+        #                           "mode": "avg", "numeric_type": "double"}
+        #         elif field.endswith("_int") or field.endswith("_flt"):
+        #             order_info = {"order": order, "unmapped_type": "float"}
+        #         else:
+        #             order_info = {"order": order, "unmapped_type": "text"}
+        #         orders.append({field: order_info})
+        #     s = s.sort(*orders)
+
         if order_by:
             orders = list()
             for field, order in order_by.fields:
                 order = "asc" if order == 0 else "desc"
-                if field in ["page_num_int", "top_int"]:
-                    order_info = {"order": order, "unmapped_type": "float",
-                                  "mode": "avg", "numeric_type": "double"}
-                elif field.endswith("_int") or field.endswith("_flt"):
-                    order_info = {"order": order, "unmapped_type": "float"}
-                else:
-                    order_info = {"order": order, "unmapped_type": "text"}
-                orders.append({field: order_info})
+                orders.append({field: {"order": order}})
             s = s.sort(*orders)
 
         # 聚合
@@ -168,9 +175,9 @@ class ESConnection(ESConnectionBase):
             try:
                 res = self.es.search(index=index_names,
                                      body=q,
-                                     timeout="60s",
+                                     timeout="6s",
                                      # search_type="dfs_query_then_fetch",
-                                     track_total_hits=True,
+                                     track_total_hits=2000,
                                      _source=True)
                 if str(res.get("timed_out", "")).lower() == "true":
                     raise Exception("Es Timeout.")

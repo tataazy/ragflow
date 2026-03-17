@@ -975,7 +975,7 @@ class Dealer:
                         break
                 return d
             except Exception as e:
-                self.logger.error(f"Error processing mom chunk {mom_id}: {e}")
+                logging.error(f"Error processing mom chunk {mom_id}: {e}")
                 return None
 
         # 使用线程池并行处理
@@ -994,6 +994,6 @@ class Dealer:
         # 按相似度排序
         chunks.sort(key=lambda x: x["similarity"] * -1)
 
-        self.logger.debug(f"retrieval_by_children processed {len(mom_chunks)} mom chunks in {time.time() - start_time:.3f}s")
+        logging.debug(f"retrieval_by_children processed {len(mom_chunks)} mom chunks in {time.time() - start_time:.3f}s")
 
         return chunks

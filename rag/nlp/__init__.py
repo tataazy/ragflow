@@ -784,6 +784,8 @@ def append_context2table_image4pdf(sections: list, tabls: list, table_context_si
     res = []
     contexts = []
     for (img, tb), poss in tabls:
+        if not poss or len(poss) == 0:
+            continue
         page, left, right, top, bott = poss[0]
         _page, _left, _right, _top, _bott = poss[-1]
         if isinstance(tb, list):
