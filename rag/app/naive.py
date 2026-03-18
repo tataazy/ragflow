@@ -40,7 +40,6 @@ from deepdoc.parser.docling_parser import DoclingParser
 from deepdoc.parser.tcadp_parser import TCADPParser
 from common.float_utils import normalize_overlapped_percent
 from common.parser_config_utils import normalize_layout_recognizer
-from common.text_utils import normalize_arabic_presentation_forms
 from rag.nlp import (
     concat_img,
     find_codec,
@@ -54,33 +53,6 @@ from rag.nlp import (
     append_context2table_image4pdf,
     tokenize_chunks_with_images,
 )  # noqa: F401
-
-
-def _normalize_section_text_for_rtl_presentation_forms(sections):
-    if not sections:
-        return sections
-
-    normalized_sections = []
-    for section in sections:
-        if isinstance(section, tuple):
-            if not section:
-                normalized_sections.append(section)
-                continue
-            text = section[0]
-            normalized_text = normalize_arabic_presentation_forms(text)
-            normalized_sections.append((normalized_text, *section[1:]))
-            continue
-        if isinstance(section, list):
-            if not section:
-                normalized_sections.append(section)
-                continue
-            text = section[0]
-            normalized_text = normalize_arabic_presentation_forms(text)
-            normalized_sections.append([normalized_text, *section[1:]])
-            continue
-        normalized_sections.append(normalize_arabic_presentation_forms(section))
-
-    return normalized_sections
 
 
 def by_deepdoc(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", callback=None, pdf_cls=None, **kwargs):
@@ -138,10 +110,9 @@ def by_mineru(
                     lang=lang,
                     **kwargs,
                 )
-                # section_images is now stored on pdf_parser.section_images by parse_pdf
                 return sections, tables, pdf_parser
             except Exception as e:
-                logging.exception(f"Failed to parse pdf via LLMBundle MinerU ({mineru_llm_name}): {e}")
+                logging.error(f"Failed to parse pdf via LLMBundle MinerU ({mineru_llm_name}): {e}")
 
     if callback:
         callback(-1, "MinerU not found.")
@@ -174,15 +145,7 @@ def by_tcadp(filename, binary=None, from_page=0, to_page=100000, lang="Chinese",
         callback(-1, "TCADP parser not available. Please check Tencent Cloud API configuration.")
         return None, None, tcadp_parser
 
-    local_zip_path = kwargs.get("local_zip_path")
-    sections, tables = tcadp_parser.parse_pdf(
-        filepath=filename,
-        binary=binary,
-        callback=callback,
-        output_dir=os.environ.get("TCADP_OUTPUT_DIR", ""),
-        file_type="PDF",
-        local_zip_path=local_zip_path
-    )
+    sections, tables = tcadp_parser.parse_pdf(filepath=filename, binary=binary, callback=callback, output_dir=os.environ.get("TCADP_OUTPUT_DIR", ""), file_type="PDF")
     return sections, tables, tcadp_parser
 
 
@@ -885,21 +848,6 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
             paddleocr_llm_name=parser_model_name,
             **kwargs,
         )
-        
-        # MinerU already returns properly sectioned content with images processed
-        # No need for double parsing - sections are already (text, tag) tuples
-        section_images = None
-        if name == "mineru":
-            # MinerU parser now returns pre-sectioned content directly
-            # Mark as markdown (MinerU returns markdown content)
-            is_markdown = True
-            # Get section_images from parser object (set by parse_pdf)
-            if pdf_parser:
-                section_images = getattr(pdf_parser, 'section_images', None)
-                img_count = len([i for i in (section_images or []) if i is not None])
-                logging.info(f"[MinerU] Received {len(sections) if sections else 0} pre-sectioned chunks with {img_count} images from parser")
-        
-        sections = _normalize_section_text_for_rtl_presentation_forms(sections)
 
         if not sections and not tables:
             return []
@@ -1037,89 +985,64 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
 
     st = timer()
     overlapped_percent = normalize_overlapped_percent(parser_config.get("overlapped_percent", 0))
-    max_chunk_size = int(parser_config.get("max_chunk_size", 10*1024*1024))
     if is_markdown:
-        # For MinerU with pre-processed images, use them directly
-        if name == "mineru" and section_images:
-            # MinerU already provides section_images, use naive_merge_with_images
-            # Use default chunk_token_num (128) instead of 0 to allow merging
-            chunk_token_num = int(parser_config.get("chunk_token_num", 128)) or 128
-            chunks, images = naive_merge_with_images(
-                sections, 
-                section_images, 
-                chunk_token_num, 
-                parser_config.get("delimiter", "\n!?。；！？"), 
-                overlapped_percent, 
-                max_chunk_size=max_chunk_size
-            )
-            # Disable child_delimiters_pattern for MinerU to avoid over-splitting
-            res.extend(tokenize_chunks_with_images(chunks, doc, is_english, images, child_delimiters_pattern=None))
-        else:
-            merged_chunks = []
-            merged_images = []
-            chunk_limit = max(0, int(parser_config.get("chunk_token_num", 128)))
+        merged_chunks = []
+        merged_images = []
+        chunk_limit = max(0, int(parser_config.get("chunk_token_num", 128)))
 
-            current_text = ""
-            current_tokens = 0
-            current_image = None
+        current_text = ""
+        current_tokens = 0
+        current_image = None
 
-            for idx, sec in enumerate(sections):
-                text = sec[0] if isinstance(sec, tuple) else sec
-                sec_tokens = num_tokens_from_string(text)
-                sec_image = section_images[idx] if section_images and idx < len(section_images) else None
+        for idx, sec in enumerate(sections):
+            text = sec[0] if isinstance(sec, tuple) else sec
+            sec_tokens = num_tokens_from_string(text)
+            sec_image = section_images[idx] if section_images and idx < len(section_images) else None
 
-                if current_text and current_tokens + sec_tokens > chunk_limit:
-                    merged_chunks.append(current_text)
-                    merged_images.append(current_image)
-                    overlap_part = ""
-                    if overlapped_percent > 0:
-                        overlap_len = int(len(current_text) * overlapped_percent / 100)
-                        if overlap_len > 0:
-                            overlap_part = current_text[-overlap_len:]
-                    current_text = overlap_part
-                    current_tokens = num_tokens_from_string(current_text)
-                    current_image = current_image if overlap_part else None
-
-                if current_text:
-                    current_text += "\n" + text
-                else:
-                    current_text = text
-                current_tokens += sec_tokens
-
-                if sec_image:
-                    current_image = concat_img(current_image, sec_image) if current_image else sec_image
-
-            if current_text:
+            if current_text and current_tokens + sec_tokens > chunk_limit:
                 merged_chunks.append(current_text)
                 merged_images.append(current_image)
+                overlap_part = ""
+                if overlapped_percent > 0:
+                    overlap_len = int(len(current_text) * overlapped_percent / 100)
+                    if overlap_len > 0:
+                        overlap_part = current_text[-overlap_len:]
+                current_text = overlap_part
+                current_tokens = num_tokens_from_string(current_text)
+                current_image = current_image if overlap_part else None
 
-            chunks = merged_chunks
-            has_images = merged_images and any(img is not None for img in merged_images)
-
-            if has_images:
-                res.extend(tokenize_chunks_with_images(chunks, doc, is_english, merged_images, child_delimiters_pattern=child_deli))
+            if current_text:
+                current_text += "\n" + text
             else:
-                res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser, child_delimiters_pattern=child_deli))
-    elif name == "mineru":
-        # MinerU without images - still disable child_delimiters_pattern
-        chunk_token_num = int(parser_config.get("chunk_token_num", 128)) or 128
-        chunks = naive_merge(sections, chunk_token_num, parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent, max_chunk_size=max_chunk_size)
-        res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser, child_delimiters_pattern=None))
+                current_text = text
+            current_tokens += sec_tokens
+
+            if sec_image:
+                current_image = concat_img(current_image, sec_image) if current_image else sec_image
+
+        if current_text:
+            merged_chunks.append(current_text)
+            merged_images.append(current_image)
+
+        chunks = merged_chunks
+        has_images = merged_images and any(img is not None for img in merged_images)
+
+        if has_images:
+            res.extend(tokenize_chunks_with_images(chunks, doc, is_english, merged_images, child_delimiters_pattern=child_deli))
+        else:
+            res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser, child_delimiters_pattern=child_deli))
     else:
         if section_images:
             if all(image is None for image in section_images):
                 section_images = None
 
-        # For MinerU, disable child_delimiters_pattern to avoid over-splitting
-        mineru_child_deli = None if name == "mineru" else child_deli
-        
         if section_images:
-            chunks, images = naive_merge_with_images(sections, section_images, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent, max_chunk_size=max_chunk_size)
-            res.extend(tokenize_chunks_with_images(chunks, doc, is_english, images, child_delimiters_pattern=mineru_child_deli))
+            chunks, images = naive_merge_with_images(sections, section_images, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
+            res.extend(tokenize_chunks_with_images(chunks, doc, is_english, images, child_delimiters_pattern=child_deli))
         else:
-            chunks = naive_merge(sections, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent, max_chunk_size=max_chunk_size)
+            chunks = naive_merge(sections, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
 
-            res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser, child_delimiters_pattern=mineru_child_deli))
+            res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser, child_delimiters_pattern=child_deli))
 
     if urls and parser_config.get("analyze_hyperlink", False) and is_root:
         for index, url in enumerate(urls):

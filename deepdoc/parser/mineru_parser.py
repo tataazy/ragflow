@@ -241,39 +241,39 @@ class MinerUParser(RAGFlowPdfParser):
 
         return True, reason
 
-
+    def _run_mineru(
+        self, input_path: Path, output_dir: Path, options: MinerUParseOptions, callback: Optional[Callable] = None
+    ) -> Path:
+        return self._run_mineru_api(input_path, output_dir, options, callback)
 
     def _run_mineru_api(
         self, input_path: Path, output_dir: Path, options: MinerUParseOptions, callback: Optional[Callable] = None
-    ) -> tuple[str, dict[str, str]]:
-        """Call MinerU API and return markdown content and images directly from JSON response.
-        
-        Returns:
-            tuple: (md_content, images_dict) where images_dict is {filename: base64_data}
-        """
+    ) -> Path:
         pdf_file_path = str(input_path)
 
         if not os.path.exists(pdf_file_path):
             raise RuntimeError(f"[MinerU] PDF file not exists: {pdf_file_path}")
 
         pdf_file_name = Path(pdf_file_path).stem.strip()
+        output_path = tempfile.mkdtemp(prefix=f"{pdf_file_name}_{options.method}_", dir=str(output_dir))
+        output_zip_path = os.path.join(str(output_dir), f"{Path(output_path).name}.zip")
 
         data = {
             "output_dir": "./output",
-            "lang_list": str(options.lang) if options.lang else "ch",
-            "backend": str(options.backend),
-            "parse_method": str(options.method),
-            "formula_enable": str(options.formula_enable).lower(),
-            "table_enable": str(options.table_enable).lower(),
+            "lang_list": options.lang,
+            "backend": options.backend,
+            "parse_method": options.method,
+            "formula_enable": options.formula_enable,
+            "table_enable": options.table_enable,
             "server_url": None,
-            "return_md": "true",
-            "return_middle_json": "false",
-            "return_model_output": "false",
-            "return_content_list": "true",  # Also get content_list as fallback
-            "return_images": "true",
-            "response_format_zip": "false",  # Direct JSON response, no ZIP
-            "start_page_id": "0",
-            "end_page_id": "99999",
+            "return_md": True,
+            "return_middle_json": True,
+            "return_model_output": True,
+            "return_content_list": True,
+            "return_images": True,
+            "response_format_zip": True,
+            "start_page_id": 0,
+            "end_page_id": 99999,
         }
 
         if options.server_url:
@@ -289,198 +289,39 @@ class MinerUParser(RAGFlowPdfParser):
             self.logger.info(f"[MinerU] invoke api: {self.mineru_api}/file_parse backend={options.backend} server_url={data.get('server_url')}")
             if callback:
                 callback(0.20, f"[MinerU] invoke api: {self.mineru_api}/file_parse")
-            
             with open(pdf_file_path, "rb") as pdf_file:
                 files = {"files": (pdf_file_name + ".pdf", pdf_file, "application/pdf")}
-                resp = requests.post(
+                with requests.post(
                     url=f"{self.mineru_api}/file_parse",
                     files=files,
                     data=data,
                     headers=headers,
                     timeout=1800,
-                )
-                resp.raise_for_status()
-                
-            result = resp.json()
-            self.logger.info("[MinerU] Api completed successfully.")
-            
-            # Debug: log response structure
-            self.logger.info(f"[MinerU] Response type: {type(result)}")
-            if isinstance(result, dict):
-                self.logger.info(f"[MinerU] Response keys: {list(result.keys())}")
-            else:
-                self.logger.warning(f"[MinerU] Unexpected response type: {type(result)}, value: {str(result)[:500]}")
-            if 'results' in result:
-                self.logger.info(f"[MinerU] Results keys: {list(result['results'].keys())}")
-                if 'document' in result['results']:
-                    doc_keys = list(result['results']['document'].keys())
-                    self.logger.info(f"[MinerU] Document keys: {doc_keys}")
-                    if 'md_content' in result['results']['document']:
-                        md_len = len(result['results']['document']['md_content'] or '')
-                        self.logger.info(f"[MinerU] md_content length: {md_len}")
-                    if 'images' in result['results']['document']:
-                        img_count = len(result['results']['document']['images'] or {})
-                        self.logger.info(f"[MinerU] images count: {img_count}")
-                if 'files' in result['results']:
-                    self.logger.info(f"[MinerU] Files keys: {list(result['results']['files'].keys())}")
-            
-            if callback:
-                callback(0.50, "[MinerU] API response received, extracting content...")
-            
-            # Extract markdown and images from response
-            # MinerU response schema: results.document.md_content and results.document.images
-            md_content, images = self._extract_from_response(result)
-            
-            if callback:
-                callback(0.60, f"[MinerU] Extracted markdown ({len(md_content)} chars) and {len(images)} images")
-            
-            return md_content, images
-            
+                    stream=True,
+                ) as response:
+                    response.raise_for_status()
+                    content_type = response.headers.get("Content-Type", "")
+                    if content_type.startswith("application/zip"):
+                        self.logger.info(f"[MinerU] zip file returned, saving to {output_zip_path}...")
+
+                        if callback:
+                            callback(0.30, f"[MinerU] zip file returned, saving to {output_zip_path}...")
+
+                        with open(output_zip_path, "wb") as f:
+                            response.raw.decode_content = True
+                            shutil.copyfileobj(response.raw, f)
+
+                        self.logger.info(f"[MinerU] Unzip to {output_path}...")
+                        self._extract_zip_no_root(output_zip_path, output_path, pdf_file_name + "/")
+
+                        if callback:
+                            callback(0.40, f"[MinerU] Unzip to {output_path}...")
+                    else:
+                        self.logger.warning(f"[MinerU] not zip returned from api: {content_type}")
         except Exception as e:
             raise RuntimeError(f"[MinerU] api failed with exception {e}")
-
-    def _extract_from_response(self, result: dict) -> tuple[str, dict[str, str]]:
-        """Extract markdown content and images from MinerU API response.
-        
-        Supports multiple response formats:
-        - Standard: results.document.* or results.files.*
-        - Filename-based: results.{filename}.* (some MinerU versions)
-        
-        Returns:
-            tuple: (md_content, images_dict) where images_dict is {filename: base64_data}
-        """
-        md_content = ""
-        images = {}
-        content_list = None
-        
-        if not isinstance(result, dict):
-            self.logger.warning(f"[MinerU] Unexpected result type: {type(result)}")
-            return md_content, images
-        
-        # Try to extract from results.document first, then results.files
-        results = result.get("results", {})
-        
-        if not isinstance(results, dict):
-            self.logger.warning(f"[MinerU] Unexpected results type: {type(results)}")
-            return md_content, images
-        
-        # Check results.document (standard format)
-        document = results.get("document", {})
-        if document and isinstance(document, dict):
-            md_content = document.get("md_content", "") or ""
-            images = document.get("images", {}) or {}
-            content_list = document.get("content_list")
-            self.logger.info(f"[MinerU] Using response path: results.document")
-        
-        # Fallback to results.files (standard format)
-        if not md_content and not images and not content_list:
-            files = results.get("files", {})
-            if files and isinstance(files, dict):
-                md_content = files.get("md_content", "") or ""
-                images = files.get("images", {}) or {}
-                content_list = files.get("content_list")
-                self.logger.info(f"[MinerU] Using response path: results.files")
-        
-        # Fallback: some MinerU versions return results.{filename}.*
-        if not md_content and not images and not content_list:
-            # Find first non-standard key that contains md_content or images
-            for key, value in results.items():
-                if key in ("document", "files"):
-                    continue
-                if isinstance(value, dict):
-                    if "md_content" in value or "images" in value or "content_list" in value:
-                        md_content = value.get("md_content", "") or ""
-                        images = value.get("images", {}) or {}
-                        content_list = value.get("content_list")
-                        self.logger.info(f"[MinerU] Using response path: results.{key}")
-                        break
-        
-        # If no md_content but have content_list, try to rebuild markdown
-        if not md_content and content_list:
-            # content_list might be a JSON string or a list
-            if isinstance(content_list, str):
-                try:
-                    content_list = json.loads(content_list)
-                    self.logger.info(f"[MinerU] Parsed content_list from JSON string, {len(content_list)} items")
-                except json.JSONDecodeError as e:
-                    self.logger.warning(f"[MinerU] Failed to parse content_list as JSON: {e}")
-                    content_list = None
-            
-            if isinstance(content_list, list):
-                self.logger.info(f"[MinerU] Rebuilding markdown from content_list ({len(content_list)} items)")
-                md_content = self._content_list_to_markdown(content_list)
-        
-        # Handle different image formats
-        processed_images = {}
-        for img_name, img_data in images.items():
-            # Image data might be base64 string or data URI
-            if isinstance(img_data, str):
-                processed_images[img_name] = img_data
-            else:
-                self.logger.warning(f"[MinerU] Unexpected image data type for {img_name}: {type(img_data)}")
-        
-        self.logger.info(f"[MinerU] Extracted {len(processed_images)} images from response")
-        return md_content, processed_images
-    
-    def _content_list_to_markdown(self, content_list: list) -> str:
-        """Convert MinerU content_list to markdown format.
-        
-        Args:
-            content_list: List of content blocks from MinerU
-            
-        Returns:
-            Markdown formatted string
-        """
-        md_parts = []
-        
-        for item in content_list:
-            item_type = item.get("type", "")
-            
-            if item_type == "text":
-                text = item.get("text", "")
-                text_level = item.get("text_level", 1)
-                if text:
-                    # Add appropriate header level
-                    if text_level <= 6:
-                        md_parts.append(f"{'#' * text_level} {text}")
-                    else:
-                        md_parts.append(text)
-                    md_parts.append("")
-                    
-            elif item_type == "table":
-                table_body = item.get("table_body", "")
-                if table_body:
-                    md_parts.append(table_body)
-                    md_parts.append("")
-                    
-            elif item_type == "image":
-                img_path = item.get("img_path", "")
-                caption = item.get("image_caption", "")
-                if img_path:
-                    caption_text = caption[0] if isinstance(caption, list) and caption else "image"
-                    md_parts.append(f"![{caption_text}]({img_path})")
-                    md_parts.append("")
-                    
-            elif item_type == "equation":
-                text = item.get("text", "")
-                if text:
-                    md_parts.append(f"$${text}$$")
-                    md_parts.append("")
-                    
-            elif item_type == "code":
-                code_body = item.get("code_body", "")
-                if code_body:
-                    md_parts.append(f"```\n{code_body}\n```")
-                    md_parts.append("")
-                    
-            elif item_type == "list":
-                list_items = item.get("list_items", [])
-                for li in list_items:
-                    md_parts.append(f"- {li}")
-                if list_items:
-                    md_parts.append("")
-        
-        return "\n".join(md_parts)
+        self.logger.info("[MinerU] Api completed successfully.")
+        return Path(output_path)
 
     def __images__(self, fnm, zoomin: int = 1, page_from=0, page_to=600, callback=None):
         self.page_from = page_from
@@ -659,82 +500,91 @@ class MinerUParser(RAGFlowPdfParser):
             poss.append(([int(p) - 1 for p in pn.split("-")], left, right, top, bottom))
         return poss
 
-    def _process_base64_images(self, md_content: str, images: dict[str, str], output_dir: Path) -> tuple[str, list[Image.Image]]:
-        """Process base64 images from MinerU response and return PIL Image objects.
-        
-        Args:
-            md_content: Markdown content with image references like ![](images/xxx.jpg)
-            images: Dictionary of {filename: base64_data_or_datauri}
-            output_dir: Directory to save processed images (for caching)
-            
-        Returns:
-            tuple: (updated_md_content, pil_images_list)
-        """
-        import base64
-        import uuid
-        from pathlib import Path
-        from io import BytesIO
-        
-        pil_images = []
-        updated_md = md_content
-        
-        # Pattern to match data URI: data:image/{ext};base64,{data}
-        b64_data_uri_pattern = re.compile(r'^data:image/(\w+);base64,(.+)$')
-        
-        for img_name, img_data in images.items():
-            original_ref = f"images/{img_name}"
-            
-            # Skip if not referenced in markdown
-            if original_ref not in md_content:
-                continue
-            
-            # Parse base64 data
-            img_bytes = None
-            ext = "png"
-            
-            if m := b64_data_uri_pattern.match(img_data):
-                ext = m.group(1)
-                try:
-                    img_bytes = base64.b64decode(m.group(2))
-                except Exception as e:
-                    self.logger.warning(f"[MinerU] Failed to decode base64 image {img_name}: {e}")
-                    continue
+    def _read_output(self, output_dir: Path, file_stem: str, method: str = "auto", backend: str = "pipeline") -> list[
+        dict[str, Any]]:
+        json_file = None
+        subdir = None
+        attempted = []
+
+        # mirror MinerU's sanitize_filename to align ZIP naming
+        def _sanitize_filename(name: str) -> str:
+            sanitized = re.sub(r"[/\\\.]{2,}|[/\\]", "", name)
+            sanitized = re.sub(r"[^\w.-]", "_", sanitized, flags=re.UNICODE)
+            if sanitized.startswith("."):
+                sanitized = "_" + sanitized[1:]
+            return sanitized or "unnamed"
+
+        safe_stem = _sanitize_filename(file_stem)
+        allowed_names = {f"{file_stem}_content_list.json", f"{safe_stem}_content_list.json"}
+        self.logger.info(f"[MinerU] Expected output files: {', '.join(sorted(allowed_names))}")
+        self.logger.info(f"[MinerU] Searching output in: {output_dir}")
+
+        jf = output_dir / f"{file_stem}_content_list.json"
+        self.logger.info(f"[MinerU] Trying original path: {jf}")
+        attempted.append(jf)
+        if jf.exists():
+            subdir = output_dir
+            json_file = jf
+        else:
+            alt = output_dir / f"{safe_stem}_content_list.json"
+            self.logger.info(f"[MinerU] Trying sanitized filename: {alt}")
+            attempted.append(alt)
+            if alt.exists():
+                subdir = output_dir
+                json_file = alt
             else:
-                # Raw base64 without data URI prefix
-                try:
-                    img_bytes = base64.b64decode(img_data)
-                except Exception as e:
-                    self.logger.warning(f"[MinerU] Failed to decode raw base64 image {img_name}: {e}")
-                    continue
-                # Try to get extension from filename
-                if '.' in img_name:
-                    ext = img_name.rsplit('.', 1)[-1]
-            
-            if not img_bytes:
-                continue
-            
-            try:
-                # Load as PIL Image
-                img = Image.open(BytesIO(img_bytes)).convert("RGB")
-                pil_images.append(img)
-                
-                # Also save to temp directory for debugging
-                new_name = f"{uuid.uuid4()}.{ext}"
-                img_path = output_dir / new_name
-                with open(img_path, "wb") as f:
-                    f.write(img_bytes)
-                
-                # Replace reference in markdown (use placeholder that won't be used)
-                updated_md = updated_md.replace(original_ref, f"[Image:{len(pil_images)-1}]")
-                
-                self.logger.info(f"[MinerU] Processed image: {img_name} -> {img.size}")
-                
-            except Exception as e:
-                self.logger.warning(f"[MinerU] Failed to process image {img_name}: {e}")
-        
-        return updated_md, pil_images
+                nested_alt = output_dir / safe_stem / f"{safe_stem}_content_list.json"
+                self.logger.info(f"[MinerU] Trying sanitized nested path: {nested_alt}")
+                attempted.append(nested_alt)
+                if nested_alt.exists():
+                    subdir = nested_alt.parent
+                    json_file = nested_alt
 
+        if not json_file:
+            raise FileNotFoundError(f"[MinerU] Missing output file, tried: {', '.join(str(p) for p in attempted)}")
 
+        with open(json_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for item in data:
+            for key in ("img_path", "table_img_path", "equation_img_path"):
+                if key in item and item[key]:
+                    item[key] = str((subdir / item[key]).resolve())
+        return data
+
+    def _transfer_to_sections(self, outputs: list[dict[str, Any]], parse_method: str = None):
+        sections = []
+        for output in outputs:
+            match output["type"]:
+                case MinerUContentType.TEXT:
+                    section = output.get("text", "")
+                case MinerUContentType.TABLE:
+                    section = output.get("table_body", "") + "\n".join(output.get("table_caption", [])) + "\n".join(
+                        output.get("table_footnote", []))
+                    if not section.strip():
+                        section = "FAILED TO PARSE TABLE"
+                case MinerUContentType.IMAGE:
+                    section = "".join(output.get("image_caption", [])) + "\n" + "".join(
+                        output.get("image_footnote", []))
+                case MinerUContentType.EQUATION:
+                    section = output.get("text", "")
+                case MinerUContentType.CODE:
+                    section = output.get("code_body", "") + "\n".join(output.get("code_caption", []))
+                case MinerUContentType.LIST:
+                    section = "\n".join(output.get("list_items", []))
+                case MinerUContentType.DISCARDED:
+                    continue  # Skip discarded blocks entirely
+
+            if section and parse_method == "manual":
+                sections.append((section, output["type"], self._line_tag(output)))
+            elif section and parse_method == "paper":
+                sections.append((section + self._line_tag(output), output["type"]))
+            else:
+                sections.append((section, self._line_tag(output)))
+        return sections
+
+    def _transfer_to_tables(self, outputs: list[dict[str, Any]]):
+        return []
 
     def parse_pdf(
             self,
@@ -749,17 +599,10 @@ class MinerUParser(RAGFlowPdfParser):
             parse_method: str = "raw",
             **kwargs,
     ) -> tuple:
-        """Parse PDF using MinerU API and return markdown content with images.
-        
-        Returns:
-            tuple: (sections, tables, section_images) where 
-                - sections is list of (text, tag) tuples
-                - section_images is list of PIL Image objects (or None)
-        """
         import shutil
 
         temp_pdf = None
-        temp_img_dir = None
+        created_tmp_dir = False
 
         parser_cfg = kwargs.get('parser_config', {})
         lang = parser_cfg.get('mineru_lang') or kwargs.get('lang', 'English')
@@ -768,7 +611,7 @@ class MinerUParser(RAGFlowPdfParser):
         enable_formula = parser_cfg.get('mineru_formula_enable', True)
         enable_table = parser_cfg.get('mineru_table_enable', True)
 
-        # remove spaces, or mineru crash
+        # remove spaces, or mineru crash, and _read_output fail too
         file_path = Path(filepath)
         pdf_file_name = file_path.stem.replace(" ", "") + ".pdf"
         pdf_file_path_valid = os.path.join(file_path.parent, pdf_file_name)
@@ -792,12 +635,18 @@ class MinerUParser(RAGFlowPdfParser):
                     callback(-1, f"[MinerU] PDF not found: {pdf}")
                 raise FileNotFoundError(f"[MinerU] PDF not found: {pdf}")
 
-        # Create temp directory for images
-        temp_img_dir = Path(tempfile.mkdtemp(prefix="mineru_img_"))
-        
-        self.logger.info(f"[MinerU] Parsing with backend={backend} api={self.mineru_api} server_url={server_url or self.mineru_server_url}")
+        if output_dir:
+            out_dir = Path(output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            out_dir = Path(tempfile.mkdtemp(prefix="mineru_pdf_"))
+            created_tmp_dir = True
+
+        self.logger.info(f"[MinerU] Output directory: {out_dir} backend={backend} api={self.mineru_api} server_url={server_url or self.mineru_server_url}")
         if callback:
-            callback(0.15, "[MinerU] Starting PDF parsing...")
+            callback(0.15, f"[MinerU] Output directory: {out_dir}")
+
+        self.__images__(pdf, zoomin=1)
 
         try:
             options = MinerUParseOptions(
@@ -810,207 +659,25 @@ class MinerUParser(RAGFlowPdfParser):
                 formula_enable=enable_formula,
                 table_enable=enable_table,
             )
-            
-            # Call API and get markdown + images directly from JSON response
-            md_content, images = self._run_mineru_api(pdf, temp_img_dir, options, callback=callback)
-            
-            if not md_content:
-                self.logger.warning("[MinerU] No markdown content returned from API")
-                self.section_images = []
-                return [], []
-            
-            self.logger.info(f"[MinerU] Received markdown ({len(md_content)} chars) and {len(images)} images from API")
+            final_out_dir = self._run_mineru(pdf, out_dir, options, callback=callback)
+            outputs = self._read_output(final_out_dir, pdf.stem, method=mineru_method_raw_str, backend=backend)
+            self.logger.info(f"[MinerU] Parsed {len(outputs)} blocks from PDF.")
             if callback:
-                callback(0.70, f"[MinerU] Received markdown ({len(md_content)} chars) and {len(images)} images")
-            
-            # Process base64 images and update markdown references
-            updated_md, pil_images = self._process_base64_images(md_content, images, temp_img_dir)
-            
-            self.logger.info(f"[MinerU] Processed {len(pil_images)} images")
-            if callback:
-                callback(0.85, f"[MinerU] Processed {len(pil_images)} images, generating sections...")
-            
-            # Split markdown into sections for chunking
-            # Use headers as natural section boundaries
-            sections, section_images = self._split_markdown_to_sections(updated_md, pil_images)
-            
-            self.logger.info(f"[MinerU] Generated {len(sections)} sections from markdown")
-            if callback:
-                callback(0.95, f"[MinerU] Generated {len(sections)} sections")
-            
-            # Store section_images on self so caller can access it
-            self.section_images = section_images
-            # Return sections and tables (section_images accessed via self.section_images)
-            return sections, []
-            
+                callback(0.75, f"[MinerU] Parsed {len(outputs)} blocks from PDF.")
+
+            return self._transfer_to_sections(outputs, parse_method), self._transfer_to_tables(outputs)
         finally:
-            # Cleanup temp files
             if temp_pdf and temp_pdf.exists():
                 try:
                     temp_pdf.unlink()
                     temp_pdf.parent.rmdir()
                 except Exception:
                     pass
-            if delete_output and temp_img_dir and temp_img_dir.exists():
+            if delete_output and created_tmp_dir and out_dir.exists():
                 try:
-                    shutil.rmtree(temp_img_dir)
+                    shutil.rmtree(out_dir)
                 except Exception:
                     pass
-
-    def _split_markdown_to_sections(self, md_content: str, pil_images: list[Image.Image] = None) -> tuple:
-        """Split markdown content into sections for chunking.
-        
-        Uses headers (# ## ###) as natural boundaries, but merges short sections
-        to avoid fragmentation. Keeps images with their context.
-        
-        Args:
-            md_content: Markdown content with [Image:X] placeholders
-            pil_images: List of PIL Image objects extracted from the document
-            
-        Returns:
-            tuple: (sections, section_images) where both are lists
-        """
-        pil_images = pil_images or []
-        
-        # Pattern to find image references [Image:X]
-        img_ref_pattern = re.compile(r'\[Image:(\d+)\]')
-        
-        # Split by headers (lines starting with #)
-        lines = md_content.split('\n')
-        
-        # First pass: collect raw sections split by headers, track images in each
-        raw_sections = []
-        current_section = []
-        current_images = set()
-        
-        for line in lines:
-            is_header = re.match(r'^#{1,6}\s', line)
-            
-            # Find image references in this line
-            img_refs = img_ref_pattern.findall(line)
-            for ref in img_refs:
-                current_images.add(int(ref))
-            
-            if is_header and current_section:
-                # Save current section
-                section_text = '\n'.join(current_section).strip()
-                if section_text:
-                    raw_sections.append((section_text, current_images.copy()))
-                current_section = [line]
-                current_images = set()
-            else:
-                current_section.append(line)
-        
-        # Don't forget the last section
-        if current_section:
-            section_text = '\n'.join(current_section).strip()
-            if section_text:
-                raw_sections.append((section_text, current_images.copy()))
-        
-        # If no sections were created (no headers), return whole content
-        if not raw_sections:
-            if md_content.strip():
-                # Return all images with the single section (if any)
-                if pil_images:
-                    combined = self._combine_images(pil_images)
-                    return [(md_content.strip(), "")], [combined]
-                return [(md_content.strip(), "")], [None]
-            return [], []
-        
-        # Second pass: merge short sections (less than 300 chars) with next section
-        MIN_SECTION_LENGTH = 300
-        merged_sections = []
-        merged_images = []
-        pending_short = None
-        pending_images = set()
-        
-        for section_text, section_imgs in raw_sections:
-            if pending_short:
-                # Merge pending short section with current
-                section_text = pending_short + "\n\n" + section_text
-                section_imgs = pending_images.union(section_imgs)
-                pending_short = None
-                pending_images = set()
-            
-            if len(section_text) < MIN_SECTION_LENGTH:
-                # Hold short sections for merging
-                pending_short = section_text
-                pending_images = section_imgs
-            else:
-                merged_sections.append(section_text)
-                merged_images.append(section_imgs)
-        
-        # Don't forget the last pending short section
-        if pending_short:
-            if merged_sections:
-                # Merge with last section
-                merged_sections[-1] = merged_sections[-1] + "\n\n" + pending_short
-                merged_images[-1] = merged_images[-1].union(pending_images)
-            else:
-                merged_sections.append(pending_short)
-                merged_images.append(pending_images)
-        
-        # Build section_images list - each section gets its own combined image
-        section_images = []
-        cleaned_sections = []
-        
-        for section_text, img_indices in zip(merged_sections, merged_images):
-            # Remove [Image:X] placeholders from text
-            cleaned_text = img_ref_pattern.sub('', section_text).strip()
-            if not cleaned_text:
-                continue
-            cleaned_sections.append(cleaned_text)
-            
-            if img_indices and pil_images:
-                # Get images for this section
-                section_pil_images = []
-                for idx in sorted(img_indices):
-                    if 0 <= idx < len(pil_images):
-                        section_pil_images.append(pil_images[idx])
-                
-                if section_pil_images:
-                    # Combine images for this section only
-                    combined = self._combine_images(section_pil_images)
-                    section_images.append(combined)
-                else:
-                    section_images.append(None)
-            else:
-                section_images.append(None)
-        
-        # Ensure lists are same length
-        min_len = min(len(cleaned_sections), len(section_images))
-        cleaned_sections = cleaned_sections[:min_len]
-        section_images = section_images[:min_len]
-        
-        # Convert to final format
-        sections = [(text, "") for text in cleaned_sections if text.strip()]
-        section_images = section_images[:len(sections)]
-        
-        img_count = len([i for i in section_images if i is not None])
-        self.logger.info(f"[MinerU] Merged {len(raw_sections)} raw sections into {len(sections)} final sections with {img_count} image sections")
-        return sections, section_images
-    
-    def _combine_images(self, images: list[Image.Image]) -> Image.Image:
-        """Combine multiple images vertically into one."""
-        if not images:
-            return None
-        if len(images) == 1:
-            return images[0]
-        
-        # Calculate total height and max width
-        total_height = sum(img.size[1] for img in images)
-        max_width = max(img.size[0] for img in images)
-        
-        # Create new image
-        combined = Image.new('RGB', (max_width, total_height), (255, 255, 255))
-        
-        # Paste images
-        y_offset = 0
-        for img in images:
-            combined.paste(img, (0, y_offset))
-            y_offset += img.size[1]
-        
-        return combined
 
 
 if __name__ == "__main__":
