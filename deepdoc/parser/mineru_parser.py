@@ -42,6 +42,8 @@ LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
 if LOCK_KEY_pdfplumber not in sys.modules:
     sys.modules[LOCK_KEY_pdfplumber] = threading.Lock()
 
+# todo 从配置中读取
+image_pre_url = "http://172.24.72.178/v1/document/image/"
 
 class MinerUContentType(StrEnum):
     IMAGE = "image"
@@ -539,8 +541,8 @@ class MinerUParser(RAGFlowPdfParser):
                                             # 看起来像文件路径（绝对路径或相对路径，不是URL）
                                             self.logger.info(f"[MinerU] 检测到文件路径格式: {img_data}")
                                             # 文件路径已经在服务器上，不需要保存
-                                            relative_path = f"{images_dir_name}/{Path(img_path).name}"
-                                            images_info[relative_path] = img_data
+                                            # 保持键名与MinerU原始返回一致（不带images/前缀）
+                                            images_info[img_path] = img_data
                                             continue
                                         else:
                                             # 纯base64格式
@@ -557,9 +559,9 @@ class MinerUParser(RAGFlowPdfParser):
                                     with open(img_save_path, 'wb') as img_file:
                                         img_file.write(img_bytes)
                                     
-                                    # 存储相对路径，便于后续上传到MinIO
-                                    relative_path = f"{images_dir_name}/{img_path}"
-                                    images_info[relative_path] = img_data
+                                    # 存储图片信息到images_info，保持键名与MinerU原始返回一致（不带images/前缀）
+                                    # 这样与md_content去掉images/后的路径保持一致
+                                    images_info[img_path] = img_data
                                     self.logger.debug(f"[MinerU] 成功保存图片: {img_save_path}, 大小: {len(img_bytes)} bytes")
                                          
                                 except Exception as e:
@@ -601,18 +603,210 @@ class MinerUParser(RAGFlowPdfParser):
                                         "image_footnote": [],
                                         "img_path": str(actual_img_path)  # 使用实际文件路径
                                     })
-                                else:
-                                    self.logger.warning(f"[MinerU] 图片文件不存在: {actual_img_path}")
+                                #else:
+                                    #self.logger.warning(f"[MinerU] 图片文件不存在: {actual_img_path}")
                                     # 尝试列出output_path_obj的内容
-                                    if output_path_obj.exists():
-                                        files = list(output_path_obj.rglob('*'))
-                                        self.logger.warning(f"[MinerU] output_path内容: {[str(f.relative_to(output_path_obj)) for f in files if f.is_file()]}")
+                                    #if output_path_obj.exists():
+                                        #files = list(output_path_obj.rglob('*'))
+                                        #self.logger.warning(f"[MinerU] output_path内容: {[str(f.relative_to(output_path_obj)) for f in files if f.is_file()]}")
 
                         self.logger.info(f"[MinerU] 创建了 {len(virtual_outputs)} 个outputs (1 text + {len(virtual_outputs)-1} images)")
                         
                         return Path(output_path), virtual_outputs
+                        
         except Exception as e:
             raise RuntimeError(f"[MinerU] api failed with exception {e}")
+
+
+    def upload_and_replace_images_in_markdown(
+        self,
+        md_content,
+        images_info: dict,
+        tenant_id: Optional[str] = None,
+        kb_id: Optional[str] = None,
+        bucket: str = "imagetemps"
+    ) -> Tuple[str, dict]:
+        """
+        上传markdown中的所有图片到MinIO，并替换引用为MinIO URL
+    
+        图片引用格式从：
+            ![](images/xxx.jpg)
+        替换为：
+            ![](minio://bucket-objname)
+    
+        Args:
+            md_content: markdown内容（支持str或可转换为str的对象）
+            images_info: 图片信息字典 {relative_path: base64_data}
+            tenant_id: 租户ID
+            kb_id: 知识库ID
+            bucket: MinIO bucket名称
+    
+        Returns:
+            Tuple[str, dict]: (替换后的markdown, 图片映射表{original_path: minio_id})
+        """
+        import xxhash
+        import logging
+        from concurrent.futures import ThreadPoolExecutor
+        
+        logger = logging.getLogger(__name__)
+        
+        # 确保md_content是字符串
+        if not isinstance(md_content, str):
+            logger.warning(f"[MinerU] md_content类型错误: {type(md_content).__name__}, 尝试转换")
+            md_content = str(md_content)
+            
+        logger.info(f"[MinerU] ========== upload_and_replace_images_in_markdown 开始 ==========")
+        logger.info(f"[MinerU] tenant_id={tenant_id}, kb_id={kb_id}, bucket={bucket}")
+        logger.info(f"[MinerU] images_info数量: {len(images_info)}")
+        logger.info(f"[MinerU] markdown内容长度: {len(md_content)} 字符")
+
+        # 图片引用正则
+        img_pattern = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+
+        # 收集所有唯一图片引用
+        found_refs = img_pattern.findall(md_content)
+        logger.info(f"[MinerU] Markdown中发现图片引用总数: {len(found_refs)}")
+
+        unique_refs = list(dict.fromkeys(found_refs))
+        logger.info(f"[MinerU] 唯一图片引用数量: {len(unique_refs)}")
+
+        # 详细打印每个图片引用
+        #for idx, (alt_text, img_path) in enumerate(unique_refs):
+            # images_info 的键不带 images/ 前缀，需要处理
+            #img_key = img_path.replace('images/', '') if img_path.startswith('images/') else img_path
+            #in_images_info = img_key in images_info
+            #logger.info(f"[MinerU]   [{idx+1}] path='{img_path}' -> key='{img_key}' in_images_info={in_images_info}")
+
+        # 准备上传任务
+        upload_tasks = []
+        image_mapping = {}  # img_path -> minio_id
+        skipped_not_in_info = 0
+        skipped_decode_error = 0
+
+        for alt_text, img_path in unique_refs:
+            # images_info 的键不带 images/ 前缀
+            img_key = img_path.replace('images/', '') if img_path.startswith('images/') else img_path
+            
+            if img_key not in images_info:
+                logger.warning(f"[MinerU] [跳过] 图片引用 '{img_path}' (key='{img_key}') 不在images_info中")
+                skipped_not_in_info += 1
+                continue
+
+            if img_path in image_mapping:
+                logger.debug(f"[MinerU] [跳过] 图片 '{img_path}' 已处理过")
+                continue
+
+            img_data = images_info[img_key]
+            logger.debug(f"[MinerU] 处理图片 '{img_path}' (key='{img_key}'), 数据类型={type(img_data).__name__}, 长度={len(str(img_data)) if img_data else 0}")
+
+            try:
+                # 解码base64
+                if img_data.startswith('data:image/'):
+                    base64_part = img_data.split(',', 1)[1]
+                    logger.debug(f"[MinerU]   提取base64部分，长度: {len(base64_part)}")
+                else:
+                    base64_part = img_data
+
+                img_bytes = base64.b64decode(base64_part)
+                logger.debug(f"[MinerU]   解码成功，图片字节数: {len(img_bytes)}")
+
+                # 验证图片格式
+                try:
+                    img_obj = Image.open(BytesIO(img_bytes))
+                    logger.debug(f"[MinerU]   图片格式: {img_obj.format}, 尺寸: {img_obj.size}")
+                except Exception as img_err:
+                    logger.warning(f"[MinerU]   图片格式验证失败: {img_err}")
+
+                # 生成唯一的minio_id
+                id_source = f"{tenant_id or ''}_{kb_id or ''}_{img_path}"
+                logger.debug(f"[MinerU]   id_source: {id_source[:50]}...")
+
+                obj_hash = xxhash.xxh64(id_source.encode()).hexdigest()
+                objname = f"{tenant_id or 'ragflow'}_{obj_hash[:16]}"
+                minio_id = f"{bucket}_{objname}"
+
+                #logger.info(f"[MinerU]   -> minio_id: {minio_id}")
+
+                image_mapping[img_path] = minio_id
+                upload_tasks.append((img_path, img_bytes, minio_id, objname))
+
+            except Exception as e:
+                logger.warning(f"[MinerU] [跳过] 解码图片 '{img_path}' 失败: {e}")
+                skipped_decode_error += 1
+                continue
+
+        logger.info(f"[MinerU] 上传任务准备完成: 总计={len(upload_tasks)}, 跳过(不在info)={skipped_not_in_info}, 跳过(解码失败)={skipped_decode_error}")
+
+        # 批量上传
+        upload_success = 0
+        upload_failed = 0
+        if upload_tasks:
+            def upload_single(task):
+                img_path, img_bytes, minio_id, objname = task
+                nonlocal upload_success, upload_failed
+                try:
+                    from common import settings
+                    #logger.info(f"[MinerU] [上传开始] {img_path} -> {objname}, 大小={len(img_bytes)} bytes")
+                    settings.STORAGE_IMPL.put(bucket=bucket, fnm=objname, binary=img_bytes)
+                    #logger.info(f"[MinerU] [上传成功] {objname}")
+                    upload_success += 1
+                    return True
+                except Exception as e:
+                    logger.warning(f"[MinerU] [上传失败] {objname}: {e}")
+                    upload_failed += 1
+                    return False
+
+            try:
+                logger.info(f"[MinerU] 开始批量上传，使用线程池(workers=8)")
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    results = list(executor.map(upload_single, upload_tasks))
+                logger.info(f"[MinerU] 批量上传完成: 成功={upload_success}, 失败={upload_failed}")
+            except Exception as e:
+                logger.error(f"[MinerU] 批量上传异常: {e}")
+                import traceback
+                logger.error(f"[MinerU] 批量上传异常详情: {traceback.format_exc()}")
+        else:
+            logger.warning(f"[MinerU] 没有需要上传的图片任务")
+
+        # 替换markdown引用
+        logger.info(f"[MinerU] 开始替换markdown中的图片引用")
+        original_img_count = len(img_pattern.findall(md_content))
+        replaced_count = 0
+        
+        # 调试：检查 image_mapping 的内容
+        logger.info(f"[MinerU] [DEBUG] image_mapping 大小: {len(image_mapping)}")
+        if image_mapping:
+            sample_keys = list(image_mapping.keys())[:3]
+            logger.info(f"[MinerU] [DEBUG] image_mapping 键样本: {sample_keys}")
+            logger.info(f"[MinerU] [DEBUG] 第一个键长度: {len(sample_keys[0]) if sample_keys else 0}")
+
+        def replace_img_ref(match):
+            nonlocal replaced_count
+            alt_text = match.group(1)
+            img_path = match.group(2)
+
+            if img_path in image_mapping:
+                minio_id = image_mapping[img_path]
+                new_ref = f"![{alt_text}]({image_pre_url}{minio_id})"
+                replaced_count += 1
+                logger.debug(f"[MinerU]   替换: {img_path} -> minio://{minio_id}")
+                return new_ref
+            logger.warning(f"[MinerU]   [未替换] 图片 '{img_path}' (长度={len(img_path)}) 不在映射表中 (映射表大小={len(image_mapping)})")
+            return match.group(0)
+
+        updated_md = img_pattern.sub(replace_img_ref, md_content)
+
+        logger.info(f"[MinerU] 替换完成: 原文图片引用={original_img_count}, 成功替换={replaced_count}")
+        logger.info(f"[MinerU] 更新后markdown长度: {len(updated_md)} 字符")
+
+        # 打印替换后的markdown样本（用于调试）
+        sample_updated = updated_md[:500] if updated_md else ""
+        logger.info(f"[MinerU] 更新后markdown样本（前500字符）: {sample_updated}")
+
+        logger.info(f"[MinerU] ========== upload_and_replace_images_in_markdown 结束 ==========")
+
+        return updated_md, image_mapping
+
 
 
     def __images__(self, fnm, zoomin: int = 1, page_from=0, page_to=600, callback=None):
@@ -979,7 +1173,67 @@ class MinerUParser(RAGFlowPdfParser):
             if callback:
                 callback(0.75, f"[MinerU] Parsed {len(outputs)} blocks from PDF.")
 
-            # 处理sections
+            # ========== 图片上传和引用替换（必须在生成sections之前） ==========
+            # 直接在 TEXT output 中替换图片引用，不破坏原有结构
+            self.logger.info(f"[MinerU] ========== 开始图片上传和引用替换 ==========")
+            
+            # 读取 images_info 文件
+            images_info = {}
+            images_info_path = final_out_dir / "_images_info.json"
+            if images_info_path.exists():
+                try:
+                    with open(images_info_path, 'r', encoding='utf-8') as f:
+                        images_info = json.load(f)
+                    self.logger.info(f"[MinerU] 读取images_info: {len(images_info)} 个条目")
+                except Exception as e:
+                    self.logger.warning(f"[MinerU] 读取images_info失败: {e}")
+            else:
+                self.logger.warning(f"[MinerU] images_info文件不存在")
+            
+            # 获取 tenant_id 和 kb_id
+            tenant_id = parser_cfg.get('tenant_id') or kwargs.get('tenant_id')
+            kb_id = parser_cfg.get('kb_id') or kwargs.get('kb_id')
+            self.logger.info(f"[MinerU] tenant_id={tenant_id}, kb_id={kb_id}")
+            
+            # 找到 TEXT output，获取 md_content
+            md_content = None
+            for output in outputs:
+                if output.get("type") == MinerUContentType.TEXT:
+                    md_content = output.get("text", "")
+                    break
+            
+            if md_content and images_info:
+                self.logger.info(f"[MinerU] 找到TEXT output，md_content长度={len(md_content)}, images_info数量={len(images_info)}")
+                
+                # 调用模块级函数上传图片并替换引用
+                updated_md, image_mapping = self.upload_and_replace_images_in_markdown(
+                    md_content=md_content,
+                    images_info=images_info,
+                    tenant_id=tenant_id,
+                    kb_id=kb_id,
+                    bucket="multi"
+                )
+                
+                self.logger.info(f"[MinerU] upload_and_replace_images_in_markdown返回: image_mapping大小={len(image_mapping)}")
+                
+                # 更新 TEXT output
+                if updated_md != md_content and image_mapping:
+                    for output in outputs:
+                        if output.get("type") == MinerUContentType.TEXT:
+                            output["text"] = updated_md
+                            self.logger.info(f"[MinerU] TEXT output已更新，替换了 {len(image_mapping)} 个图片引用")
+                            break
+                elif not image_mapping:
+                    self.logger.warning(f"[MinerU] image_mapping为空，跳过替换")
+            else:
+                if not md_content:
+                    self.logger.warning(f"[MinerU] 未找到TEXT output，跳过图片处理")
+                if not images_info:
+                    self.logger.warning(f"[MinerU] images_info为空，跳过图片处理")
+            
+            self.logger.info(f"[MinerU] ========== 图片上传和引用替换结束 ==========")
+            
+            # 处理sections（必须在图片替换之后，这样才能使用替换后的md_content）
             sections = self._transfer_to_sections(outputs, parse_method)
             
             # 如果需要返回图片信息
@@ -1030,7 +1284,7 @@ class MinerUParser(RAGFlowPdfParser):
                             
                         if not os.path.exists(img_path):
                             fail_reasons["file_not_exist"] += 1
-                            self.logger.debug(f"[MinerU] 图片文件不存在: {img_path}")
+                            #self.logger.debug(f"[MinerU] 图片文件不存在: {img_path}")
                             section_images.append(None)
                             continue
                             

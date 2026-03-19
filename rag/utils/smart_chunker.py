@@ -192,67 +192,147 @@ class SmartChunker:
 
     def _distribute_images_to_chunks(self, original_texts: List[str], images: List, 
                                    text_chunks: List[str]) -> List:
-        """将图片分配到对应的文本chunks中"""
+        """将图片分配到对应的文本chunks中
+        
+        使用基于内容重叠的分配策略，而非依赖位置索引。
+        """
         self.logger.info(f"[SmartChunker] 开始图片分配 - 原始文本段落数: {len(original_texts)}, 图片数: {len(images)}, chunks数: {len(text_chunks)}")
         
         if not images or not text_chunks:
             self.logger.warning(f"[SmartChunker] 图片或chunks为空，返回全None数组")
             return [None] * len(text_chunks)
         
-        # 构建原始文本在合并文本中的位置映射
-        combined_text = "\n".join([t for t in original_texts if t])
-        self.logger.info(f"[SmartChunker] 合并文本长度: {len(combined_text)} 字符")
+        # 统计图片分布
+        total_images = len([img for img in images if img is not None])
+        self.logger.info(f"[SmartChunker] 原始数据中有 {total_images} 张非None图片")
         
-        positions = []
-        current_pos = 0
+        # 方法1：使用语义重叠匹配（更可靠）
+        image_chunks = self._semantic_image_distribution(original_texts, images, text_chunks)
         
-        for orig_text in original_texts:
-            if orig_text:
-                start = combined_text.find(orig_text, current_pos)
-                if start != -1:
-                    end = start + len(orig_text)
-                    positions.append((start, end, orig_text))
-                    current_pos = end
-                    self.logger.debug(f"[SmartChunker] 定位文本段落: 位置[{start}:{end}], 内容预览: {orig_text[:50]}")
-                else:
-                    positions.append((current_pos, current_pos, orig_text))
-                    self.logger.warning(f"[SmartChunker] 无法定位文本段落: {orig_text[:50]}")
-            else:
-                positions.append((current_pos, current_pos, ""))
+        final_count = len([img for img in image_chunks if img is not None])
+        self.logger.info(f"[SmartChunker] 语义匹配分配完成，分配了 {final_count} 张图片到chunks")
         
+        if final_count < total_images * 0.5:
+            # 如果语义匹配效果不好，尝试备用方案
+            self.logger.warning(f"[SmartChunker] 语义匹配效果不佳({final_count}/{total_images})，尝试备用方案")
+            fallback_chunks = self._sequential_image_distribution(original_texts, images, text_chunks)
+            fallback_count = len([img for img in fallback_chunks if img is not None])
+            if fallback_count > final_count:
+                self.logger.info(f"[SmartChunker] 备用方案更好({fallback_count}/{total_images})，使用备用方案")
+                return fallback_chunks
+        
+        return image_chunks
+
+    def _semantic_image_distribution(self, original_texts: List[str], images: List, 
+                                    text_chunks: List[str]) -> List:
+        """基于内容重叠的图片分配
+        
+        对于每个chunk，找到所有与其内容重叠的原始段落，
+        如果这些段落中有图片，则将图片分配给该chunk。
+        """
         image_chunks = []
         
-        # 基于位置重叠分配图片到chunks
-        for i, chunk_text in enumerate(text_chunks):
-            chunk_start = combined_text.find(chunk_text)
-            if chunk_start == -1:
-                self.logger.warning(f"[SmartChunker] 无法定位chunk {i} 在合并文本中")
+        for chunk_idx, chunk_text in enumerate(text_chunks):
+            if not chunk_text:
                 image_chunks.append(None)
                 continue
+            
+            chunk_images = []
+            
+            # 策略：对每个原始段落，检查其内容是否出现在chunk中
+            for seg_idx, (orig_text, image) in enumerate(zip(original_texts, images)):
+                if image is None or not orig_text:
+                    continue
                 
-            chunk_end = chunk_start + len(chunk_text)
-            self.logger.debug(f"[SmartChunker] 处理chunk {i}: 位置[{chunk_start}:{chunk_end}], 长度: {len(chunk_text)}")
+                # 简化匹配：只检查较短的文本片段是否包含在chunk中
+                # 或chunk是否包含较短的文本片段
+                orig_len = len(orig_text)
+                chunk_len = len(chunk_text)
+                
+                # 选择较小的文本作为搜索目标，提高匹配成功率
+                if orig_len < chunk_len and orig_len > 5:
+                    # 检查原始段落是否在chunk中
+                    if orig_text in chunk_text:
+                        chunk_images.append((seg_idx, image))
+                        self.logger.debug(f"[SmartChunker] chunk {chunk_idx} ← 段落 {seg_idx} (精确匹配)")
+                elif chunk_len < orig_len and chunk_len > 5:
+                    # 检查chunk是否在原始段落中（不太可能，但试试无妨）
+                    if chunk_text in orig_text:
+                        chunk_images.append((seg_idx, image))
+                        self.logger.debug(f"[SmartChunker] chunk {chunk_idx} ← 段落 {seg_idx} (反向匹配)")
             
-            # 找到与当前chunk位置重叠的所有原始段落
-            overlapping_images = []
-            for j, (start, end, orig_text) in enumerate(positions):
-                if images[j] is not None:
-                    # 检查位置区间是否有重叠
-                    if start < chunk_end and end > chunk_start:
-                        overlapping_images.append((j, images[j]))
-                        self.logger.debug(f"[SmartChunker] chunk {i} 与段落 {j} 重叠: 段落位置[{start}:{end}], chunk位置[{chunk_start}:{chunk_end}]")
-            
-            # 如果有重叠的图片，选择第一个或者合并
-            if overlapping_images:
-                selected_image = overlapping_images[0][1]  # 选择第一个重叠的图片
-                self.logger.info(f"[SmartChunker] chunk {i} 分配图片: 来自段落 {overlapping_images[0][0]}, 图片类型: {type(selected_image).__name__}")
+            # 分配图片
+            if chunk_images:
+                # 选择第一个匹配的图片（简化处理）
+                selected_image = chunk_images[0][1]
                 image_chunks.append(selected_image)
+                self.logger.debug(f"[SmartChunker] chunk {chunk_idx} 分配图片来自段落 {chunk_images[0][0]}")
             else:
-                self.logger.debug(f"[SmartChunker] chunk {i} 无重叠图片")
                 image_chunks.append(None)
         
-        final_non_none = len([img for img in image_chunks if img is not None])
-        self.logger.info(f"[SmartChunker] 图片分配完成 - 总chunks: {len(image_chunks)}, 有图片的chunks: {final_non_none}")
+        return image_chunks
+
+    def _sequential_image_distribution(self, original_texts: List[str], images: List,
+                                     text_chunks: List[str]) -> List:
+        """顺序分配策略
+        
+        按顺序遍历sections，维护一个累积的文本缓冲区。
+        当累积文本达到一个chunk大小时，创建一个新的chunk，
+        并将之前所有包含图片的section的图片累积到该chunk。
+        """
+        image_chunks = []
+        
+        # 计算每个chunk的目标token数（估算）
+        avg_chunk_size = sum(len(c) for c in text_chunks) / len(text_chunks) if text_chunks else 1000
+        self.logger.info(f"[SmartChunker] 顺序分配策略 - 平均chunk大小: {avg_chunk_size:.0f} 字符")
+        
+        # 构建section列表（过滤空文本但保留索引映射）
+        valid_sections = []
+        for i, (text, image) in enumerate(zip(original_texts, images)):
+            if text:  # 只保留非空文本
+                valid_sections.append({
+                    'original_idx': i,
+                    'text': text,
+                    'image': image,
+                    'length': len(text)
+                })
+        
+        # 按顺序分配图片到chunks
+        section_idx = 0
+        for chunk_idx, chunk_text in enumerate(text_chunks):
+            if not chunk_text:
+                image_chunks.append(None)
+                continue
+            
+            chunk_len = len(chunk_text)
+            
+            # 找到所有与当前chunk对应的sections
+            # 策略：从当前位置开始，收集足够覆盖chunk长度的sections
+            accumulated_text = ""
+            accumulated_images = []
+            corresponding_sections = []
+            
+            while section_idx < len(valid_sections) and len(accumulated_text) < chunk_len * 1.2:
+                section = valid_sections[section_idx]
+                accumulated_text += "\n" + section['text']
+                if section['image'] is not None:
+                    accumulated_images.append(section['image'])
+                corresponding_sections.append(section['original_idx'])
+                section_idx += 1
+            
+            # 检查当前chunk是否在这个累积范围内
+            if chunk_text in accumulated_text or accumulated_text in chunk_text:
+                # 如果有图片，分配第一张
+                if accumulated_images:
+                    image_chunks.append(accumulated_images[0])
+                    self.logger.debug(f"[SmartChunker] chunk {chunk_idx} 顺序分配来自sections {corresponding_sections[0]}-{corresponding_sections[-1]}")
+                else:
+                    image_chunks.append(None)
+            else:
+                # chunk不在累积范围内，说明有遗漏
+                # 回退一些sections
+                section_idx = max(0, section_idx - 2)
+                image_chunks.append(None)
         
         return image_chunks
 
