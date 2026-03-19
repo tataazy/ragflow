@@ -46,9 +46,8 @@ class DocumentStructureAnalyzer:
             'math_block': re.compile(r'\$\$.*?\$\$', re.DOTALL),
             'image': re.compile(r'!\[[^\]]*\]\([^)]+\)'),
             'link': re.compile(r'\[[^\]]*\]\([^)]+\)'),
-            'table_header': re.compile(r'(?:\|[^|\n]*)+\|[\\r\\n]+\s*(?:\|\\s*:?-{3,}:?\\s*)+\|'),
-            'table_row': re.compile(r'(?:\|[^|\n]*)+\|[\\r\\n]+'),
-            'code_block': re.compile(r'```(?:\\w+)?[\\r\\n].*?```', re.DOTALL),
+            'table': re.compile(r'(?:\|[^\n|]+)+\|[\r\n]+(?:\|\s*:?-+:?\s*\|[\r\n]+)?(?:\|[^\n|]+\|[\r\n]+)+'),
+            'code_block': re.compile(r'```[\s\S]*?```'),
             'inline_code': re.compile(r'`[^`]+`'),
             'math_inline': re.compile(r'\$[^$]+\$(?!\$)')
         }
@@ -200,6 +199,12 @@ class DocumentStructureAnalyzer:
         """
         智能分割文本，保护重要内容不被分割
         
+        核心原则：
+        1. 语义完整性：保持句子、段落、主题边界
+        2. 结构保护：表格、图片、代码块必须完整保留
+        3. 质量过滤：过滤无意义的噪声内容
+        4. 自然合并：短内容应与上下文合并
+        
         Args:
             text: 要分割的文本
             max_chunk_size: 最大chunk大小
@@ -211,6 +216,9 @@ class DocumentStructureAnalyzer:
         if separators is None:
             separators = ["\n\n", "\n", "。", "！", "？", ".", "!", "?"]
         
+        # 预处理：清理文本中的噪声
+        text = self._preprocess_text(text)
+        
         # 找出受保护的内容
         protected_spans = self._find_protected_spans(text)
         
@@ -220,7 +228,124 @@ class DocumentStructureAnalyzer:
         # 合并单元成chunks
         chunks = self._merge_units_to_chunks(units, max_chunk_size)
         
+        # 后处理：过滤和合并短chunk
+        chunks = self._post_process_chunks(chunks)
+        
         return chunks
+    
+    def _preprocess_text(self, text: str) -> str:
+        """
+        预处理文本：清理噪声内容
+        
+        处理规则：
+        1. 移除独立的 "Text" 行（MinerU的元信息标记）
+        2. 合并断行的数学公式
+        3. 清理无意义的空白
+        """
+        lines = text.split('\n')
+        result_lines = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # 跳过独立的 "Text" 元信息标记
+            if line == "Text":
+                i += 1
+                continue
+            
+            # 处理可能断行的数学公式（如 $ + succ$）
+            if line == '$' and i + 2 < len(lines):
+                # 检查是否是断行的数学公式
+                next_line = lines[i + 1].strip()
+                if i + 2 < len(lines):
+                    third_line = lines[i + 2].strip()
+                    if third_line.startswith('$') and len(third_line) > 1:
+                        # 合并为一行: $ + next + third$
+                        combined = '$' + next_line + third_line
+                        result_lines.append(combined)
+                        i += 3
+                        continue
+            
+            result_lines.append(lines[i])
+            i += 1
+        
+        return '\n'.join(result_lines)
+    
+    def _post_process_chunks(self, chunks: List[str]) -> List[str]:
+        """
+        后处理chunks：过滤噪声、合并短chunk
+        
+        处理规则：
+        1. 合并孤立的图片链接到上下文
+        2. 过滤孤立的过短数学公式（如 $@$）
+        3. 合并过短的chunk到上一个chunk
+        """
+        if not chunks:
+            return chunks
+        
+        # 正则模式
+        image_pattern = re.compile(r'^!\[[^\]]*\]\([^)]+\)$')
+        math_pattern = re.compile(r'^\$[\s\S]*?\$$')
+        
+        processed = []
+        
+        for chunk in chunks:
+            stripped = chunk.strip()
+            
+            # 规则1：过滤孤立且过短的图片链接
+            if image_pattern.match(stripped) and len(stripped) < 200:
+                # 合并到上一个chunk
+                if processed:
+                    processed[-1] = processed[-1] + "\n" + stripped
+                continue
+            
+            # 规则2：过滤孤立的过短数学公式（如 $@$）
+            if math_pattern.match(stripped) and len(stripped) < 20:
+                # 合并到上一个chunk
+                if processed:
+                    processed[-1] = processed[-1] + " " + stripped
+                continue
+            
+            processed.append(chunk)
+        
+        # 规则3：将短标题合并到下一个chunk（标题本身没有分块价值）
+        result = []
+        i = 0
+        while i < len(processed):
+            chunk = processed[i]
+            stripped = chunk.strip()
+            
+            # 检查是否是短标题（以#开头且长度<100）
+            is_short_heading = stripped.startswith('#') and len(stripped) < 100
+            
+            if is_short_heading and i + 1 < len(processed):
+                # 短标题和下一个chunk合并
+                next_chunk = processed[i + 1]
+                merged = chunk + "\n" + next_chunk
+                result.append(merged)
+                i += 2  # 跳过已合并的两个
+                continue
+            elif is_short_heading:
+                # 标题是最后一个，说明前面已经合并过了，合并到上一个
+                if result:
+                    result[-1] = result[-1] + "\n" + chunk
+                else:
+                    result.append(chunk)
+                i += 1
+                continue
+            
+            # 如果当前chunk太短（非标题），合并到上一个
+            if len(stripped) < 50 and result:
+                if not stripped.startswith('|') and not stripped.startswith('```'):
+                    result[-1] = result[-1] + "\n" + chunk
+                    i += 1
+                    continue
+            
+            result.append(chunk)
+            i += 1
+        
+        return result
 
     def _build_splitting_units(self, text: str, protected_spans: List[ProtectedContentSpan], 
                               separators: List[str]) -> List[Tuple[str, int, int, bool]]:
@@ -306,7 +431,11 @@ class DocumentStructureAnalyzer:
 
     def _merge_units_to_chunks(self, units: List[Tuple[str, int, int, bool]], 
                               max_chunk_size: int) -> List[str]:
-        """将分割单元合并成chunks"""
+        """将分割单元合并成chunks
+        
+        核心原则：受保护内容（表格、图片、代码块等）必须完整保留，
+        即使超过 max_chunk_size 也不能被分割。
+        """
         chunks = []
         current_chunk = ""
         current_size = 0
@@ -317,32 +446,42 @@ class DocumentStructureAnalyzer:
             
             content_size = len(content.encode('utf-8'))
             
-            # 如果添加当前单元会超出大小限制
-            if current_chunk and current_size + content_size > max_chunk_size:
-                # 如果当前单元是受保护的且很大，需要特殊处理
-                if is_protected and content_size > max_chunk_size:
-                    # 受保护的大内容单独成为一个chunk
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                    chunks.append(content.strip())
-                    current_chunk = ""
-                    current_size = 0
-                else:
-                    # 正常情况，先保存当前chunk，再开始新的
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                    current_chunk = content
-                    current_size = content_size
+            # 核心逻辑：受保护内容必须完整保留，不能分割
+            if is_protected:
+                # 受保护内容：先保存当前chunk，再单独成为一个chunk
+                if current_chunk:
+                    stripped = current_chunk.strip()
+                    if stripped:
+                        chunks.append(stripped)
+                # 受保护内容单独作为一个chunk（即使超长）
+                stripped = content.strip()
+                if stripped:
+                    chunks.append(stripped)
+                current_chunk = ""
+                current_size = 0
+            elif current_chunk and current_size + content_size > max_chunk_size:
+                # 普通内容，超出限制了，保存当前chunk，开始新的
+                stripped = current_chunk.strip()
+                if stripped:
+                    chunks.append(stripped)
+                current_chunk = content
+                current_size = content_size
             else:
-                # 可以添加到当前chunk
+                # 普通内容，可以添加到当前chunk
                 current_chunk += content
                 current_size += content_size
             
             i += 1
         
         # 添加最后一个chunk
-        if current_chunk:
-            chunks.append(current_chunk.strip())
+        stripped = current_chunk.strip()
+        if stripped and stripped[0] not in ',.。!！?？':
+            chunks.append(stripped)
+        elif stripped and stripped[0] in ',.。!！?？':
+            if chunks:
+                chunks[-1] = chunks[-1] + stripped
+            else:
+                chunks.append(stripped)
         
         return chunks
 

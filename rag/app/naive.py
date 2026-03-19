@@ -757,8 +757,8 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
     use_smart_chunking = parser_config.get("use_smart_chunking", True)
     if use_smart_chunking:
         smart_config = {
-            "chunk_size": int(parser_config.get("chunk_token_num", 512)) * 4,  # 估算转换
-            "chunk_overlap": int(parser_config.get("chunk_token_num", 512)) * int(parser_config.get("overlapped_percent", 0)) // 100 * 4,
+            "chunk_size": max(1024, int(parser_config.get("chunk_token_num", 512)) * 3),  # 更合理的转换比例
+            "chunk_overlap": int(parser_config.get("chunk_token_num", 512)) * int(parser_config.get("overlapped_percent", 0)) // 100,
             "separators": ["\n\n", "\n", "。", "！", "？", ".", "!", "?"],
             "preserve_elements": ["table", "image", "code_block", "math_block"],
             "strategy": "structure_aware"

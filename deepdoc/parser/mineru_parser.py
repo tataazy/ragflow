@@ -782,6 +782,8 @@ class MinerUParser(RAGFlowPdfParser):
 
         def replace_img_ref(match):
             nonlocal replaced_count
+            # 获取原始匹配之前的上下文（用于检查换行）
+            prefix = md_content[:match.start()]
             alt_text = match.group(1)
             img_path = match.group(2)
 
@@ -790,6 +792,14 @@ class MinerUParser(RAGFlowPdfParser):
                 new_ref = f"![{alt_text}]({image_pre_url}{minio_id})"
                 replaced_count += 1
                 logger.debug(f"[MinerU]   替换: {img_path} -> minio://{minio_id}")
+                # 检查图片前是否有足够的换行（确保表格后图片能正确渲染）
+                if prefix:
+                    if prefix.endswith('>'):
+                        # 可能是表格结束，添加换行确保渲染正确
+                        return '\n\n' + new_ref
+                    elif not prefix.endswith(('\n', '\r\n')):
+                        # 如果前面不是换行结尾，添加换行
+                        return '\n' + new_ref
                 return new_ref
             logger.warning(f"[MinerU]   [未替换] 图片 '{img_path}' (长度={len(img_path)}) 不在映射表中 (映射表大小={len(image_mapping)})")
             return match.group(0)
