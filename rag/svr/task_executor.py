@@ -408,34 +408,35 @@ async def build_chunks(task, progress_callback):
     is_pdf_file = task["name"].lower().endswith('.pdf') if task.get("name") else False
     
     if is_pdf_file:
+        logging.debug(f"No Skipping gibberish detection for non-PDF file: {task['name']}")
         # 过滤掉明显包含乱码的chunks
-        filtered_cks = []
-        removed_count = 0
-        st = timer()
-        for ck in cks:
-            content = ck.get("content_with_weight", "")
-            #if content:
-            if content and not is_gibberish(content, threshold=0.3):  # 使用较低阈值进行严格检测
-                # 进一步清理内容
-                cleaned_content = filter_gibberish(content, min_length=10)
-                #cleaned_content = content
-                if cleaned_content and len(cleaned_content.strip()) >= 10:
-                    ck["content_with_weight"] = cleaned_content.strip()
-                    filtered_cks.append(ck)
-                else:
-                    removed_count += 1
-            else:
-                removed_count += 1
-        
-        gibberish_time = timer() - st
-        if removed_count > 0:
-            logging.info(f"Removed {removed_count} chunks containing gibberish from {task['name']} (time: {gibberish_time:.2f}s)")
-            progress_callback(msg=f"Filtered out {removed_count} chunks with乱码 content (time: {gibberish_time:.2f}s)")
-        else:
-            logging.info(f"No gibberish chunks found in {task['name']} (time: {gibberish_time:.2f}s)")
-            progress_callback(msg=f"Gibberish check completed (time: {gibberish_time:.2f}s)")
-        
-        cks = filtered_cks
+        # filtered_cks = []
+        # removed_count = 0
+        # st = timer()
+        # for ck in cks:
+        #     content = ck.get("content_with_weight", "")
+        #     #if content:
+        #     if content and not is_gibberish(content, threshold=0.3):  # 使用较低阈值进行严格检测
+        #         # 进一步清理内容
+        #         cleaned_content = filter_gibberish(content, min_length=10)
+        #         #cleaned_content = content
+        #         if cleaned_content and len(cleaned_content.strip()) >= 10:
+        #             ck["content_with_weight"] = cleaned_content.strip()
+        #             filtered_cks.append(ck)
+        #         else:
+        #             removed_count += 1
+        #     else:
+        #         removed_count += 1
+        #
+        # gibberish_time = timer() - st
+        # if removed_count > 0:
+        #     logging.info(f"Removed {removed_count} chunks containing gibberish from {task['name']} (time: {gibberish_time:.2f}s)")
+        #     progress_callback(msg=f"Filtered out {removed_count} chunks with乱码 content (time: {gibberish_time:.2f}s)")
+        # else:
+        #     logging.info(f"No gibberish chunks found in {task['name']} (time: {gibberish_time:.2f}s)")
+        #     progress_callback(msg=f"Gibberish check completed (time: {gibberish_time:.2f}s)")
+        #
+        # cks = filtered_cks
     else:
         logging.debug(f"Skipping gibberish detection for non-PDF file: {task['name']}")
     

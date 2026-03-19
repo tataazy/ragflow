@@ -53,6 +53,7 @@ from rag.nlp import (
     append_context2table_image4pdf,
     tokenize_chunks_with_images,
 )  # noqa: F401
+from rag.utils.smart_chunker import create_smart_chunker, smart_merge, smart_merge_with_images
 
 
 def by_deepdoc(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", callback=None, pdf_cls=None, **kwargs):
@@ -102,17 +103,22 @@ def by_mineru(
             try:
                 ocr_model = LLMBundle(tenant_id=tenant_id, llm_type=LLMType.OCR, llm_name=mineru_llm_name, lang=lang)
                 pdf_parser = ocr_model.mdl
-                sections, tables = pdf_parser.parse_pdf(
+                sections, tables, section_images = pdf_parser.parse_pdf(
                     filepath=filename,
                     binary=binary,
                     callback=callback,
                     parse_method=parse_method,
                     lang=lang,
+                    return_section_images=True,
                     **kwargs,
                 )
-                return sections, tables, pdf_parser
+                return sections, tables, section_images, pdf_parser
             except Exception as e:
                 logging.error(f"Failed to parse pdf via LLMBundle MinerU ({mineru_llm_name}): {e}")
+                logging.error(f"Exception type: {type(e).__name__}")
+                logging.error(f"Exception args: {e.args}")
+                import traceback
+                logging.error(f"Full traceback: {traceback.format_exc()}")
 
     if callback:
         callback(-1, "MinerU not found.")
@@ -746,6 +752,20 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
 
     is_english = lang.lower() == "english"  # is_english(cks)
     parser_config = kwargs.get("parser_config", {"chunk_token_num": 512, "delimiter": "\n!?。；！？", "layout_recognize": "DeepDOC", "analyze_hyperlink": True})
+    
+    # 智能分割配置
+    use_smart_chunking = parser_config.get("use_smart_chunking", True)
+    if use_smart_chunking:
+        smart_config = {
+            "chunk_size": int(parser_config.get("chunk_token_num", 512)) * 4,  # 估算转换
+            "chunk_overlap": int(parser_config.get("chunk_token_num", 512)) * int(parser_config.get("overlapped_percent", 0)) // 100 * 4,
+            "separators": ["\n\n", "\n", "。", "！", "？", ".", "!", "?"],
+            "preserve_elements": ["table", "image", "code_block", "math_block"],
+            "strategy": "structure_aware"
+        }
+        smart_chunker = create_smart_chunker(smart_config)
+    else:
+        smart_chunker = None
 
     child_deli = (parser_config.get("children_delimiter") or "").encode("utf-8").decode("unicode_escape").encode("latin1").decode("utf-8")
     cust_child_deli = re.findall(r"`([^`]+)`", child_deli)
@@ -836,7 +856,12 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
         parser = PARSERS.get(name, by_plaintext)
         callback(0.1, "Start to parse.")
 
-        sections, tables, pdf_parser = parser(
+        # 对于MinerU等已经结构化的内容，禁用子分隔符避免过度分割
+        if name == "mineru":  # 只对MinerU生效
+            child_deli = ""  # 清空子分隔符，让智能分割器处理
+
+        # 调用解析器并处理不同返回值格式的兼容性
+        parser_result = parser(
             filename=filename,
             binary=binary,
             from_page=from_page,
@@ -848,6 +873,27 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
             paddleocr_llm_name=parser_model_name,
             **kwargs,
         )
+        
+        # 添加详细的调试日志
+        logging.info(f"[DEBUG] 解析器 {name} 返回值数量: {len(parser_result)}")
+        logging.info(f"[DEBUG] 解析器返回值类型: {[type(item).__name__ for item in parser_result]}")
+        
+        # 根据返回值数量进行解包（兼容不同解析器）
+        if len(parser_result) == 4:
+            sections, tables, section_images, pdf_parser = parser_result
+            logging.info(f"[DEBUG] 4值解包完成 - sections: {len(sections)}, tables: {len(tables)}, section_images: {len(section_images) if section_images else 0}")
+            if section_images:
+                non_none_images = len([img for img in section_images if img is not None])
+                logging.info(f"[DEBUG] section_images中非None图片: {non_none_images}")
+                logging.info(f"[DEBUG] section_images前5个元素类型: {[type(img).__name__ if img is not None else 'None' for img in section_images[:5]]}")
+        elif len(parser_result) == 3:
+            sections, tables, pdf_parser = parser_result
+            section_images = None  # 其他解析器不支持图片信息
+            logging.info(f"[DEBUG] 3值解包完成 - sections: {len(sections)}, tables: {len(tables)}, section_images: None")
+        else:
+            error_msg = f"Unexpected parser return value count: {len(parser_result)}"
+            logging.error(f"[DEBUG] {error_msg}")
+            raise ValueError(error_msg)
 
         if not sections and not tables:
             return []
@@ -857,6 +903,9 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
 
         if name in ["tcadp", "docling", "mineru", "paddleocr"]:
             parser_config["chunk_token_num"] = 0
+            # 只对MinerU等结构化解析器启用markdown分支
+            if name == "mineru":
+                is_markdown = True  # MinerU返回markdown格式内容
 
         res = tokenize_table(tables, doc, is_english)
         callback(0.8, "Finish parsing.")
@@ -906,7 +955,7 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
             return_section_images=True,
         )
 
-        is_markdown = True
+        is_markdown = True  # MinerU返回的是markdown格式，强制设置为True
 
         try:
             vision_model = LLMBundle(kwargs["tenant_id"], LLMType.IMAGE2TEXT)
@@ -986,50 +1035,102 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
     st = timer()
     overlapped_percent = normalize_overlapped_percent(parser_config.get("overlapped_percent", 0))
     if is_markdown:
-        merged_chunks = []
-        merged_images = []
-        chunk_limit = max(0, int(parser_config.get("chunk_token_num", 128)))
+        if use_smart_chunking and smart_chunker:
+            logging.info("is_markdown and smart_chunker  process!")
+            # 使用智能分割
+            merged_chunks = []
+            merged_images = []
+            
+            # 合并所有sections为一个文本
+            combined_text = ""
+            combined_images = []
+            for idx, sec in enumerate(sections):
+                text = sec[0] if isinstance(sec, tuple) else sec
+                # 严谨的空值检查：确保section_images存在且索引有效
+                sec_image = None
+                if section_images is not None and isinstance(section_images, list) and idx < len(section_images):
+                    sec_image = section_images[idx]
+                combined_text += "\n" + text if combined_text else text
+                combined_images.append(sec_image)
+            
+            # 智能分割
+            text_chunks = smart_chunker.split_document(combined_text, "markdown")
+            
+            # 分配图片到chunks
+            image_chunks = smart_chunker._distribute_images_to_chunks(
+                [sec[0] if isinstance(sec, tuple) else sec for sec in sections],
+                combined_images,
+                text_chunks
+            )
+            
+            merged_chunks = text_chunks
+            merged_images = image_chunks
+        else:
+            # 原有逻辑
+            merged_chunks = []
+            merged_images = []
+            chunk_limit = max(0, int(parser_config.get("chunk_token_num", 128)))
 
-        current_text = ""
-        current_tokens = 0
-        current_image = None
+            current_text = ""
+            current_tokens = 0
+            current_image = None
 
-        for idx, sec in enumerate(sections):
-            text = sec[0] if isinstance(sec, tuple) else sec
-            sec_tokens = num_tokens_from_string(text)
-            sec_image = section_images[idx] if section_images and idx < len(section_images) else None
+            for idx, sec in enumerate(sections):
+                text = sec[0] if isinstance(sec, tuple) else sec
+                sec_tokens = num_tokens_from_string(text)
+                sec_image = section_images[idx] if section_images and idx < len(section_images) else None
 
-            if current_text and current_tokens + sec_tokens > chunk_limit:
-                merged_chunks.append(current_text)
-                merged_images.append(current_image)
-                overlap_part = ""
-                if overlapped_percent > 0:
-                    overlap_len = int(len(current_text) * overlapped_percent / 100)
-                    if overlap_len > 0:
-                        overlap_part = current_text[-overlap_len:]
-                current_text = overlap_part
-                current_tokens = num_tokens_from_string(current_text)
-                current_image = current_image if overlap_part else None
+                if current_text and current_tokens + sec_tokens > chunk_limit:
+                    merged_chunks.append(current_text)
+                    merged_images.append(current_image)
+                    overlap_part = ""
+                    if overlapped_percent > 0:
+                        overlap_len = int(len(current_text) * overlapped_percent / 100)
+                        if overlap_len > 0:
+                            overlap_part = current_text[-overlap_len:]
+                    current_text = overlap_part
+                    current_tokens = num_tokens_from_string(current_text)
+                    current_image = current_image if overlap_part else None
+
+                if current_text:
+                    current_text += "\n" + text
+                else:
+                    current_text = text
+                current_tokens += sec_tokens
+
+                if sec_image:
+                    current_image = concat_img(current_image, sec_image) if current_image else sec_image
 
             if current_text:
-                current_text += "\n" + text
-            else:
-                current_text = text
-            current_tokens += sec_tokens
-
-            if sec_image:
-                current_image = concat_img(current_image, sec_image) if current_image else sec_image
-
-        if current_text:
-            merged_chunks.append(current_text)
-            merged_images.append(current_image)
+                merged_chunks.append(current_text)
+                merged_images.append(current_image)
 
         chunks = merged_chunks
         has_images = merged_images and any(img is not None for img in merged_images)
+        
+        # 添加最终决策的详细日志
+        logging.info(f"[DEBUG] 最终决策点:")
+        logging.info(f"[DEBUG]   merged_chunks数量: {len(merged_chunks)}")
+        logging.info(f"[DEBUG]   merged_images数量: {len(merged_images)}")
+        logging.info(f"[DEBUG]   has_images: {has_images}")
+        
+        if merged_images:
+            final_non_none = len([img for img in merged_images if img is not None])
+            logging.info(f"[DEBUG]   最终非None图片数量: {final_non_none}")
+            logging.info(f"[DEBUG]   最终图片类型分布: {[type(img).__name__ if img is not None else 'None' for img in merged_images]}")
+            
+            # 特别检查为什么has_images可能是False
+            if final_non_none > 0 and not has_images:
+                logging.error(f"[DEBUG] 警告: 检测到矛盾 - 有{final_non_none}个非None图片但has_images为False")
+                # 强制设置为True进行调试
+                has_images = True
+                logging.info(f"[DEBUG] 强制设置has_images为True进行调试")
 
         if has_images:
+            logging.info(f"[DEBUG] 选择tokenize_chunks_with_images路径处理带图片内容")
             res.extend(tokenize_chunks_with_images(chunks, doc, is_english, merged_images, child_delimiters_pattern=child_deli))
         else:
+            logging.info(f"[DEBUG] 选择tokenize_chunks路径处理纯文本内容")
             res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser, child_delimiters_pattern=child_deli))
     else:
         if section_images:
@@ -1037,10 +1138,55 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
                 section_images = None
 
         if section_images:
-            chunks, images = naive_merge_with_images(sections, section_images, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
+            # 添加详细的图片处理日志
+            logging.info(f"[DEBUG] 开始处理带图片的sections合并...")
+            logging.info(f"[DEBUG] sections数量: {len(sections)}")
+            logging.info(f"[DEBUG] section_images数量: {len(section_images)}")
+            non_none_count = len([img for img in section_images if img is not None])
+            logging.info(f"[DEBUG] 非None图片数量: {non_none_count}")
+            
+            if use_smart_chunking and smart_chunker:
+                logging.info(f"[DEBUG] 使用智能分割处理带图片内容")
+                # 使用智能分割处理带图片的内容
+                text_sections = [sec[0] if isinstance(sec, tuple) else sec for sec in sections]
+                logging.info(f"[DEBUG] 提取的文本sections数量: {len(text_sections)}")
+                logging.info(f"[DEBUG] 前3个文本sections预览: {text_sections[:3]}")
+                
+                chunks, images = smart_merge_with_images(
+                    text_sections,
+                    section_images,
+                    int(parser_config.get("chunk_token_num", 128)),
+                    parser_config.get("delimiter", "\n!?。；！？"),
+                    overlapped_percent
+                )
+                logging.info(f"[DEBUG] 智能分割结果 - chunks: {len(chunks)}, images: {len(images)}")
+                if images:
+                    images_non_none = len([img for img in images if img is not None])
+                    logging.info(f"[DEBUG] 分割后非None图片数量: {images_non_none}")
+            else:
+                logging.info(f"[DEBUG] 使用原有逻辑处理带图片内容")
+                # 原有逻辑
+                chunks, images = naive_merge_with_images(sections, section_images, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
+                logging.info(f"[DEBUG] 原有逻辑结果 - chunks: {len(chunks)}, images: {len(images)}")
+            
             res.extend(tokenize_chunks_with_images(chunks, doc, is_english, images, child_delimiters_pattern=child_deli))
         else:
-            chunks = naive_merge(sections, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
+            logging.info(f"[DEBUG] section_images为空，使用纯文本处理")
+            if use_smart_chunking and smart_chunker:
+                logging.info(f"[DEBUG] 使用智能分割处理纯文本")
+                # 使用智能分割处理纯文本
+                chunks = smart_merge(
+                    sections,
+                    int(parser_config.get("chunk_token_num", 128)),
+                    parser_config.get("delimiter", "\n!?。；！？"),
+                    overlapped_percent
+                )
+                logging.info(f"[DEBUG] 智能分割纯文本结果 - chunks: {len(chunks)}")
+            else:
+                logging.info(f"[DEBUG] 使用原有逻辑处理纯文本")
+                # 原有逻辑
+                chunks = naive_merge(sections, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
+                logging.info(f"[DEBUG] 原有逻辑纯文本结果 - chunks: {len(chunks)}")
 
             res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser, child_delimiters_pattern=child_deli))
 

@@ -1,0 +1,66 @@
+{
+    "chunking_strategies": {
+        "default": {
+            "name": "默认分割策略",
+            "description": "基于文本长度的基础分割策略",
+            "chunk_size": 512,
+            "chunk_overlap": 128,
+            "separators": ["\n\n", "\n", "。", "！", "？", ".", "!", "?"],
+            "preserve_elements": ["table", "image", "code_block", "math_block"],
+            "strategy": "basic"
+        },
+        "structure_aware": {
+            "name": "结构感知分割策略",
+            "description": "基于文档结构的智能分割策略，保护重要内容单元",
+            "chunk_size": 512,
+            "chunk_overlap": 128,
+            "separators": ["\n\n", "\n", "。", "！", "？", ".", "!", "?"],
+            "preserve_elements": ["table", "image", "code_block", "math_block", "heading"],
+            "strategy": "structure_aware",
+            "min_chunk_size": 100,
+            "max_chunk_size": 2048
+        },
+        "semantic": {
+            "name": "语义分割策略",
+            "description": "基于语义相似度的分割策略",
+            "chunk_size": 512,
+            "chunk_overlap": 256,
+            "separators": ["\n\n", "\n", "。", "！", "？"],
+            "preserve_elements": ["table", "image", "code_block", "math_block"],
+            "strategy": "semantic",
+            "similarity_threshold": 0.7
+        }
+    },
+    "mineru_optimization": {
+        "enabled": true,
+        "target_chunk_count": 80,
+        "use_smart_chunking": true,
+        "preserve_images": true,
+        "image_context_size": 200,
+        "table_context_size": 300,
+        "enable_parent_child": false,
+        "parent_chunk_size": 2048,
+        "child_chunk_size": 512
+    },
+    "content_protection": {
+        "protected_patterns": {
+            "math_block": "\\$\\$.*?\\$\\$",
+            "image": "!\\[[^\\]]*\\]\\([^)]+\\)",
+            "link": "\\[[^\\]]*\\]\\([^)]+\\)",
+            "table_header": "(?:\\|[^|\\n]*)+\\|[\\\\r\\\\n]+\\s*(?:\\|\\\\s*:?-{3,}:?\\\\s*)+\\|",
+            "table_row": "(?:\\|[^|\\n]*)+\\|[\\\\r\\\\n]+",
+            "code_block": "```(?:\\\\w+)?[\\\\r\\\\n].*?```",
+            "inline_code": "`[^`]+`",
+            "math_inline": "\\$[^$]+\\$(?!\\$)"
+        },
+        "protection_enabled": true,
+        "merge_small_chunks": true,
+        "min_chunk_length": 50
+    },
+    "performance": {
+        "max_concurrent_processes": 4,
+        "memory_limit_mb": 1024,
+        "timeout_seconds": 300,
+        "batch_size": 10
+    }
+}

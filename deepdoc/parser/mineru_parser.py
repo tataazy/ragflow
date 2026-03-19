@@ -13,6 +13,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+import base64
 import json
 import logging
 import os
@@ -22,11 +23,12 @@ import sys
 import tempfile
 import threading
 import zipfile
+import base64
 from dataclasses import dataclass
 from io import BytesIO
 from os import PathLike
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Dict, List, Tuple
 
 import numpy as np
 import pdfplumber
@@ -120,6 +122,28 @@ class MinerUParseMethod(StrEnum):
 
 
 @dataclass
+class ImageReference:
+    """图片引用信息"""
+    original_ref: str  # 原始引用路径
+    alt_text: str      # 替代文本
+    image_data: bytes  # 图片数据
+    mime_type: str     # MIME类型
+    start_pos: int     # 在文本中的起始位置
+    end_pos: int       # 在文本中的结束位置
+
+
+@dataclass
+class ProcessedImage:
+    """处理后的图片信息"""
+    url: str           # 图片URL
+    caption: str       # 图片说明
+    ocr_text: str      # OCR识别文本
+    original_url: str  # 原始URL
+    start_pos: int     # 起始位置
+    end_pos: int       # 结束位置
+
+
+@dataclass
 class MinerUParseOptions:
     """Options for MinerU PDF parsing."""
 
@@ -139,10 +163,118 @@ class MinerUParser(RAGFlowPdfParser):
         self.mineru_server_url = mineru_server_url.rstrip("/")
         self.outlines = []
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.b64_data_uri_pattern = re.compile(r'^data:image/(\w+);base64,(.+)$')
+        self.image_ref_pattern = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
 
     @staticmethod
     def _is_zipinfo_symlink(member: zipfile.ZipInfo) -> bool:
         return (member.external_attr >> 16) & 0o170000 == 0o120000
+
+    def extract_image_references(self, markdown_content: str) -> List[ImageReference]:
+        """从Markdown内容中提取图片引用"""
+        references = []
+        
+        for match in self.image_ref_pattern.finditer(markdown_content):
+            alt_text = match.group(1)
+            image_path = match.group(2)
+            start_pos = match.start()
+            end_pos = match.end()
+            
+            references.append(ImageReference(
+                original_ref=image_path,
+                alt_text=alt_text,
+                image_data=b'',  # 将在后续处理中填充
+                mime_type='',    # 将在后续处理中填充
+                start_pos=start_pos,
+                end_pos=end_pos
+            ))
+        
+        return references
+
+    def decode_base64_image(self, b64_str: str) -> Tuple[bytes, str]:
+        """解码base64图片数据"""
+        try:
+            if match := self.b64_data_uri_pattern.match(b64_str):
+                # data URI格式: data:image/png;base64,...
+                ext = match.group(1)
+                b64_data = match.group(2)
+                image_bytes = base64.b64decode(b64_data)
+                mime_type = f"image/{ext}"
+            else:
+                # 纯base64数据
+                image_bytes = base64.b64decode(b64_str)
+                mime_type = "image/png"  # 默认PNG
+                
+            return image_bytes, mime_type
+        except Exception as e:
+            self.logger.warning(f"Failed to decode base64 image: {e}")
+            return b'', ''
+
+    def process_images_with_context(self, md_content: str, images_b64: Dict[str, str], 
+                                  sections: List) -> Tuple[str, List[ProcessedImage]]:
+        """处理图片引用，建立上下文关联"""
+        # 提取图片引用
+        image_refs = self.extract_image_references(md_content)
+        
+        # 处理base64图片数据
+        processed_images = []
+        updated_content = md_content
+        
+        for ref in image_refs:
+            # 查找对应的base64数据
+            image_key = ref.original_ref.replace('images/', '')
+            if image_key in images_b64:
+                image_data, mime_type = self.decode_base64_image(images_b64[image_key])
+                if image_data:
+                    # 创建处理后的图片信息
+                    processed_img = ProcessedImage(
+                        url=f"storage://{ref.original_ref}",  # 临时URL格式
+                        caption=ref.alt_text,
+                        ocr_text="",  # TODO: 添加OCR功能
+                        original_url=ref.original_ref,
+                        start_pos=ref.start_pos,
+                        end_pos=ref.end_pos
+                    )
+                    
+                    # 更新引用信息
+                    ref.image_data = image_data
+                    ref.mime_type = mime_type
+                    processed_images.append(processed_img)
+                    
+                    self.logger.info(f"Processed image: {ref.original_ref}, size: {len(image_data)} bytes")
+            
+        return updated_content, processed_images
+
+    def store_images(self, processed_images: List[ProcessedImage], image_data_map: Dict[str, bytes],
+                    storage_path: str = None) -> List[ProcessedImage]:
+        """存储图片并更新URL"""
+        if not storage_path:
+            storage_path = tempfile.mkdtemp(prefix="mineru_images_")
+        
+        stored_images = []
+        
+        for img in processed_images:
+            if img.original_url in image_data_map:
+                try:
+                    # 生成文件名
+                    filename = os.path.basename(img.original_url)
+                    if not filename:
+                        filename = f"image_{hash(img.original_url)}.png"
+                    
+                    # 保存图片
+                    file_path = os.path.join(storage_path, filename)
+                    with open(file_path, 'wb') as f:
+                        f.write(image_data_map[img.original_url])
+                    
+                    # 更新URL为本地路径
+                    img.url = file_path
+                    stored_images.append(img)
+                    
+                    self.logger.info(f"Stored image: {file_path}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to store image {img.original_url}: {e}")
+            
+        return stored_images
 
     def _extract_zip_no_root(self, zip_path, extract_to, root_dir):
         self.logger.info(f"[MinerU] Extract zip: zip_path={zip_path}, extract_to={extract_to}, root_hint={root_dir}")
@@ -243,12 +375,12 @@ class MinerUParser(RAGFlowPdfParser):
 
     def _run_mineru(
         self, input_path: Path, output_dir: Path, options: MinerUParseOptions, callback: Optional[Callable] = None
-    ) -> Path:
+    ) -> tuple[Path, list]:
         return self._run_mineru_api(input_path, output_dir, options, callback)
 
     def _run_mineru_api(
         self, input_path: Path, output_dir: Path, options: MinerUParseOptions, callback: Optional[Callable] = None
-    ) -> Path:
+    ) -> tuple[Path, list]:
         pdf_file_path = str(input_path)
 
         if not os.path.exists(pdf_file_path):
@@ -267,11 +399,11 @@ class MinerUParser(RAGFlowPdfParser):
             "table_enable": options.table_enable,
             "server_url": None,
             "return_md": True,
-            "return_middle_json": True,
-            "return_model_output": True,
+            "return_middle_json": False,  # 与WeKnora保持一致，减少不必要数据传输
+            "return_model_output": False,  # 与WeKnora保持一致
             "return_content_list": True,
             "return_images": True,
-            "response_format_zip": True,
+            "response_format_zip": False,  # 与WeKnora保持一致，返回JSON格式
             "start_page_id": 0,
             "end_page_id": 99999,
         }
@@ -316,12 +448,172 @@ class MinerUParser(RAGFlowPdfParser):
 
                         if callback:
                             callback(0.40, f"[MinerU] Unzip to {output_path}...")
+                        
+                        # ZIP模式下仍然返回空outputs，让上层使用_read_output
+                        return Path(output_path), []
                     else:
-                        self.logger.warning(f"[MinerU] not zip returned from api: {content_type}")
+                        # 处理JSON响应 (与WeKnora保持一致)
+                        self.logger.info(f"[MinerU] JSON response received, content-type: {content_type}")
+                        
+                        if callback:
+                            callback(0.30, f"[MinerU] processing JSON response")
+                        
+                        # 读取JSON响应
+                        response_data = response.json()
+                        
+                        # 解析MinerU JSON响应结构
+                        # 实际结构: {"results": {"filename": {"md_content": "...", "images": {...}}}}
+                        document_data = None
+                        if 'results' in response_data and isinstance(response_data['results'], dict):
+                            # 获取第一个（也是唯一的）文件结果
+                            file_results = response_data['results']
+                            if file_results:
+                                first_file_key = list(file_results.keys())[0]
+                                document_data = file_results[first_file_key]
+                                self.logger.info(f"[MinerU] Using response path: results.{first_file_key}")
+                        
+                        if not document_data:
+                            self.logger.warning("[MinerU] No valid document data found in response")
+                            raise RuntimeError("[MinerU] Invalid response structure")
+                        
+                        # 提取markdown内容和图片
+                        md_content = document_data.get('md_content', '')
+                        images_data = document_data.get('images', {})
+                        
+                        # 添加诊断日志确认images_data的实际格式
+                        if images_data:
+                            self.logger.info(f"[MinerU] images_data类型: {type(images_data)}, 键数量: {len(images_data)}")
+                            # 获取第一个样本查看实际数据格式
+                            first_key = list(images_data.keys())[0] if images_data else None
+                            first_value = images_data[first_key] if first_key else None
+                            if first_value:
+                                self.logger.info(f"[MinerU] 图片数据样本 - key: {first_key}, value类型: {type(first_value)}, value长度: {len(str(first_value)) if first_value else 0}")
+                                self.logger.info(f"[MinerU] 图片数据样本 - value前100字符: {str(first_value)[:100]}")
+                        
+                        # 创建输出目录
+                        output_path_obj = Path(output_path)
+                        output_path_obj.mkdir(parents=True, exist_ok=True)
+                        
+                        # 保存markdown内容
+                        md_file_path = output_path_obj / f"{pdf_file_name}.md"
+                        with open(md_file_path, 'w', encoding='utf-8') as f:
+                            f.write(md_content)
+                        
+                        # 处理图片数据
+                        if images_data:
+                            images_dir = output_path_obj / "images"
+                            images_dir.mkdir(exist_ok=True)
+                            
+                            # 构建图片信息字典
+                            images_info = {}
+                            images_dir_name = "images"
+                            
+                            for img_path, img_data in images_data.items():
+                                try:
+                                    img_data_str = str(img_data) if img_data else ""
+                                    self.logger.debug(f"[MinerU] 处理图片: {img_path}, 数据类型: {type(img_data)}, 长度: {len(img_data_str)}")
+                                    
+                                    # 处理不同格式的图片数据
+                                    if isinstance(img_data, dict):
+                                        # 如果是字典格式，检查是否包含file_path或base64字段
+                                        self.logger.info(f"[MinerU] 图片数据为字典格式，包含字段: {list(img_data.keys())}")
+                                        if 'base64' in img_data:
+                                            img_data = img_data['base64']
+                                        elif 'file_path' in img_data or 'path' in img_data:
+                                            img_path = img_data.get('file_path') or img_data.get('path')
+                                            self.logger.info(f"[MinerU] 图片为文件路径: {img_path}")
+                                            # 文件路径已经在服务器上，不需要保存
+                                            relative_path = f"{images_dir_name}/{Path(img_path).name}"
+                                            images_info[relative_path] = img_data
+                                            continue
+                                        else:
+                                            self.logger.warning(f"[MinerU] 未知字典格式: {img_data.keys()}")
+                                            continue
+                                    
+                                    elif isinstance(img_data, str):
+                                        # 字符串格式，可能是base64或文件路径
+                                        if img_data.startswith('data:image/'):
+                                            # data URI格式: data:image/png;base64,...
+                                            base64_part = img_data.split(',', 1)[1]
+                                        elif os.path.isabs(img_data) or ('/' in img_data and not img_data.startswith('http')):
+                                            # 看起来像文件路径（绝对路径或相对路径，不是URL）
+                                            self.logger.info(f"[MinerU] 检测到文件路径格式: {img_data}")
+                                            # 文件路径已经在服务器上，不需要保存
+                                            relative_path = f"{images_dir_name}/{Path(img_path).name}"
+                                            images_info[relative_path] = img_data
+                                            continue
+                                        else:
+                                            # 纯base64格式
+                                            base64_part = img_data
+                                    else:
+                                        self.logger.warning(f"[MinerU] 未知图片数据类型: {type(img_data)}")
+                                        continue
+                                    
+                                    # 解码并保存base64图片
+                                    img_bytes = base64.b64decode(base64_part)
+                                    img_save_path = images_dir / img_path
+                                    img_save_path.parent.mkdir(parents=True, exist_ok=True)
+                                    
+                                    with open(img_save_path, 'wb') as img_file:
+                                        img_file.write(img_bytes)
+                                    
+                                    # 存储相对路径，便于后续上传到MinIO
+                                    relative_path = f"{images_dir_name}/{img_path}"
+                                    images_info[relative_path] = img_data
+                                    self.logger.debug(f"[MinerU] 成功保存图片: {img_save_path}, 大小: {len(img_bytes)} bytes")
+                                         
+                                except Exception as e:
+                                    self.logger.warning(f"[MinerU] Failed to process image {img_path}: {e}")
+                                    continue
+                        
+                        # 保存图片信息到临时文件，供后续使用
+                        if images_info:
+                            images_info_path = output_path_obj / "_images_info.json"
+                            with open(images_info_path, 'w', encoding='utf-8') as f:
+                                json.dump(images_info, f, ensure_ascii=False)
+                        
+                        self.logger.info(f"[MinerU] JSON response processed successfully")
+                        if callback:
+                            callback(0.40, f"[MinerU] JSON response processed")
+                        
+                        # 直接返回处理好的数据，避免写文件再读取的冗余操作
+                        virtual_outputs = [{
+                            "type": "text",
+                            "text": md_content,
+                            "page_number": 1
+                        }]
+                        
+                        # 如果有图片信息，直接使用第一次保存的文件路径创建IMAGE输出
+                        if images_info:
+                            self.logger.info(f"[MinerU] images_info包含 {len(images_info)} 个图片条目")
+                            
+                            for img_relative_path, img_data in images_info.items():
+                                # 第一次遍历已经将图片保存为实际文件
+                                # img_relative_path格式是 "images/xxx"，需要转换为实际文件路径
+                                actual_img_path = output_path_obj / img_relative_path
+                                
+                                self.logger.debug(f"[MinerU] 检查图片路径: {actual_img_path}, exists={actual_img_path.exists()}")
+                                
+                                if actual_img_path.exists():
+                                    virtual_outputs.append({
+                                        "type": MinerUContentType.IMAGE,
+                                        "image_caption": [f"图片: {img_relative_path}"],
+                                        "image_footnote": [],
+                                        "img_path": str(actual_img_path)  # 使用实际文件路径
+                                    })
+                                else:
+                                    self.logger.warning(f"[MinerU] 图片文件不存在: {actual_img_path}")
+                                    # 尝试列出output_path_obj的内容
+                                    if output_path_obj.exists():
+                                        files = list(output_path_obj.rglob('*'))
+                                        self.logger.warning(f"[MinerU] output_path内容: {[str(f.relative_to(output_path_obj)) for f in files if f.is_file()]}")
+
+                        self.logger.info(f"[MinerU] 创建了 {len(virtual_outputs)} 个outputs (1 text + {len(virtual_outputs)-1} images)")
+                        
+                        return Path(output_path), virtual_outputs
         except Exception as e:
             raise RuntimeError(f"[MinerU] api failed with exception {e}")
-        self.logger.info("[MinerU] Api completed successfully.")
-        return Path(output_path)
+
 
     def __images__(self, fnm, zoomin: int = 1, page_from=0, page_to=600, callback=None):
         self.page_from = page_from
@@ -337,7 +629,9 @@ class MinerUParser(RAGFlowPdfParser):
             self.logger.exception(e)
 
     def _line_tag(self, bx):
-        pn = [bx["page_idx"] + 1]
+        # 容错处理：如果缺少page_idx，默认为第1页
+        page_idx = bx.get("page_idx", 0)
+        pn = [page_idx + 1]
         positions = bx.get("bbox", (0, 0, 0, 0))
         x0, top, x1, bott = positions
         # Normalize flipped coordinates (MinerU may report inverted bbox for flipped images)
@@ -346,8 +640,8 @@ class MinerUParser(RAGFlowPdfParser):
         if top > bott:
             top, bott = bott, top
 
-        if hasattr(self, "page_images") and self.page_images and len(self.page_images) > bx["page_idx"]:
-            page_width, page_height = self.page_images[bx["page_idx"]].size
+        if hasattr(self, "page_images") and self.page_images and len(self.page_images) > page_idx:
+            page_width, page_height = self.page_images[page_idx].size
             x0 = (x0 / 1000.0) * page_width
             x1 = (x1 / 1000.0) * page_width
             top = (top / 1000.0) * page_height
@@ -550,6 +844,22 @@ class MinerUParser(RAGFlowPdfParser):
             for key in ("img_path", "table_img_path", "equation_img_path"):
                 if key in item and item[key]:
                     item[key] = str((subdir / item[key]).resolve())
+        
+        # 读取额外的图片信息
+        images_info_path = output_dir / "_images_info.json"
+        if images_info_path.exists():
+            try:
+                with open(images_info_path, 'r', encoding='utf-8') as f:
+                    images_info = json.load(f)
+                # 将图片信息添加到返回数据中
+                data.append({
+                    "type": "_images_info",
+                    "images": images_info
+                })
+                self.logger.info(f"[MinerU] Loaded {len(images_info)} images info")
+            except Exception as e:
+                self.logger.warning(f"[MinerU] Failed to load images info: {e}")
+        
         return data
 
     def _transfer_to_sections(self, outputs: list[dict[str, Any]], parse_method: str = None):
@@ -597,6 +907,8 @@ class MinerUParser(RAGFlowPdfParser):
             server_url: Optional[str] = None,
             delete_output: bool = True,
             parse_method: str = "raw",
+            return_images: bool = True,  # 新增参数
+            return_section_images: bool = False,  # 新增参数
             **kwargs,
     ) -> tuple:
         import shutil
@@ -659,13 +971,92 @@ class MinerUParser(RAGFlowPdfParser):
                 formula_enable=enable_formula,
                 table_enable=enable_table,
             )
-            final_out_dir = self._run_mineru(pdf, out_dir, options, callback=callback)
-            outputs = self._read_output(final_out_dir, pdf.stem, method=mineru_method_raw_str, backend=backend)
+            final_out_dir, outputs = self._run_mineru(pdf, out_dir, options, callback=callback)
+            # 如果outputs为空或者需要从文件读取，则使用传统方式
+            if not outputs:
+                outputs = self._read_output(final_out_dir, pdf.stem, method=mineru_method_raw_str, backend=backend)
             self.logger.info(f"[MinerU] Parsed {len(outputs)} blocks from PDF.")
             if callback:
                 callback(0.75, f"[MinerU] Parsed {len(outputs)} blocks from PDF.")
 
-            return self._transfer_to_sections(outputs, parse_method), self._transfer_to_tables(outputs)
+            # 处理sections
+            sections = self._transfer_to_sections(outputs, parse_method)
+            
+            # 如果需要返回图片信息
+            if return_images:
+                # 这里应该从MinerU的响应中提取图片数据
+                # 目前简化处理，后续可以增强
+                image_sections = []
+                for output in outputs:
+                    if output.get("type") == MinerUContentType.IMAGE:
+                        # 提取图片相关信息
+                        image_caption = "\n".join(output.get("image_caption", []))
+                        image_footnote = "\n".join(output.get("image_footnote", []))
+                        image_section = image_caption + image_footnote
+                        if image_section.strip():
+                            image_sections.append((image_section, "@IMAGE@"))
+                
+                # 合并文本和图片sections
+                combined_sections = []
+                text_idx = 0
+                img_idx = 0
+                
+                # 简单的交替合并策略（可根据实际需求优化）
+                while text_idx < len(sections) or img_idx < len(image_sections):
+                    if text_idx < len(sections):
+                        combined_sections.append(sections[text_idx])
+                        text_idx += 1
+                    if img_idx < len(image_sections):
+                        combined_sections.append(image_sections[img_idx])
+                        img_idx += 1
+                
+                sections = combined_sections
+
+            # 如果需要返回section_images，则收集图片信息
+            section_images = []
+            if return_section_images:
+                success_count = 0
+                fail_reasons = {"empty_path": 0, "file_not_exist": 0, "open_failed": 0, "other_type": 0}
+                
+                for output in outputs:
+                    if output.get("type") == MinerUContentType.IMAGE:
+                        # 从保存的图片文件创建PIL Image对象
+                        img_path = output.get("img_path", "")
+                        
+                        if not img_path:
+                            fail_reasons["empty_path"] += 1
+                            section_images.append(None)
+                            continue
+                            
+                        if not os.path.exists(img_path):
+                            fail_reasons["file_not_exist"] += 1
+                            self.logger.debug(f"[MinerU] 图片文件不存在: {img_path}")
+                            section_images.append(None)
+                            continue
+                            
+                        try:
+                            img_obj = Image.open(img_path)
+                            success_count += 1
+                            section_images.append(img_obj)
+                        except Exception as e:
+                            fail_reasons["open_failed"] += 1
+                            self.logger.warning(f"[MinerU] Failed to open image file {img_path}: {e}")
+                            section_images.append(None)
+                    else:
+                        fail_reasons["other_type"] += 1
+                        section_images.append(None)
+                
+                # 添加详细的诊断日志
+                self.logger.info(f"[MinerU] 图片加载诊断: 总outputs={len(outputs)}, 成功={success_count}, 失败原因: 空路径={fail_reasons['empty_path']}, 文件不存在={fail_reasons['file_not_exist']}, 打开失败={fail_reasons['open_failed']}, 非图片类型={fail_reasons['other_type']}")
+            
+            # 调试信息
+            tables_result = self._transfer_to_tables(outputs)
+            self.logger.info(f"[MinerU] Returning: sections={len(sections)}, tables={len(tables_result)}, section_images={len(section_images) if section_images else 0}")
+            
+            # 始终返回4个值，与by_mineru的期望一致
+            result = (sections, tables_result, section_images if return_section_images else None, self)
+            self.logger.info(f"[MinerU] Return tuple length: {len(result)}")
+            return result
         finally:
             if temp_pdf and temp_pdf.exists():
                 try:
