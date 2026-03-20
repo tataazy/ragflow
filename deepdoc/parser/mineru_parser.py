@@ -723,7 +723,7 @@ class MinerUParser(RAGFlowPdfParser):
 
                 obj_hash = xxhash.xxh64(id_source.encode()).hexdigest()
                 objname = f"{tenant_id or 'ragflow'}_{obj_hash[:16]}"
-                minio_id = f"{bucket}_{objname}"
+                minio_id = f"{bucket}-{objname}"
 
                 #logger.info(f"[MinerU]   -> minio_id: {minio_id}")
 

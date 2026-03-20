@@ -789,6 +789,27 @@ async def change_parser():
         return server_error_response(e)
 
 
+@manager.route("/image/back/<image_id>", methods=["GET"])  # noqa: F821
+# @login_required
+async def get_image_back(image_id):
+    try:
+        # 图片ID格式: bucket_objname (用下划线连接)
+        # 例如: multi_ragflow_9d4d413996b1c7e4 -> bucket=multi, objname=ragflow_9d4d413996b1c7e4
+        # 注意: objname中可能包含下划线，所以用第一个_分割
+        arr = image_id.split("_")
+        if len(arr) < 2:
+            return get_data_error_result(message="Invalid image id format.")
+        bkt = arr[0]  # bucket
+        nm = "_".join(arr[1:])  # objname (可能有下划线)
+        data = await thread_pool_exec(settings.STORAGE_IMPL.get, bkt, nm)
+        if data is None:
+            return get_data_error_result(message="Image not found.")
+        response = await make_response(data)
+        response.headers.set("Content-Type", "image/JPEG")
+        return response
+    except Exception as e:
+        return server_error_response(e)
+
 @manager.route("/image/<image_id>", methods=["GET"])  # noqa: F821
 # @login_required
 async def get_image(image_id):
@@ -803,7 +824,6 @@ async def get_image(image_id):
         return response
     except Exception as e:
         return server_error_response(e)
-
 
 @manager.route("/upload_and_parse", methods=["POST"])  # noqa: F821
 @login_required

@@ -48,8 +48,13 @@ class DocumentStructureAnalyzer:
             'link': re.compile(r'\[[^\]]*\]\([^)]+\)'),
             'table': re.compile(r'(?:\|[^\n|]+)+\|[\r\n]+(?:\|\s*:?-+:?\s*\|[\r\n]+)?(?:\|[^\n|]+\|[\r\n]+)+'),
             'code_block': re.compile(r'```[\s\S]*?```'),
+            # HTML 表格 (mineru 输出格式)
+            'html_table': re.compile(r'<table>[\s\S]*?</table>', re.DOTALL),
             'inline_code': re.compile(r'`[^`]+`'),
-            'math_inline': re.compile(r'\$[^$]+\$(?!\$)')
+            # 数学公式：$...\%$ 或 $...$ (mineru输出格式如 $3 . 1 \%$)，支持多行
+            # 关键：不要让 [^$] 匹配 \%，否则 \%$ 会被分开
+            # 使用负向前瞻确保 \ 不被 [^$] 匹配
+            'math_inline': re.compile(r'\$[^\$]*(?:\\.[^\$]*)*(?:\%$|\$)', re.DOTALL)
         }
         
         # 标题模式
@@ -194,54 +199,456 @@ class DocumentStructureAnalyzer:
         
         return elements
 
-    def smart_split_text(self, text: str, max_chunk_size: int = 512, 
+    def smart_split_text(self, text: str, max_chunk_size: int = 512,
                         separators: List[str] = None) -> List[str]:
         """
-        智能分割文本，保护重要内容不被分割
-        
-        核心原则：
-        1. 语义完整性：保持句子、段落、主题边界
-        2. 结构保护：表格、图片、代码块必须完整保留
-        3. 质量过滤：过滤无意义的噪声内容
-        4. 自然合并：短内容应与上下文合并
-        
+        智能分割 Markdown 文档
+
+        核心策略：按标题层级分段，在大段内部按段落/句子分 chunk
+
+        处理流程：
+        1. 预处理：清理噪声、合并跨行内容
+        2. 识别标题层级，建立文档结构树
+        3. 按标题划分大段落
+        4. 每个大段落如果超过 max_chunk_size，再按段落分割
+        5. 合并过短的 chunks
+
         Args:
-            text: 要分割的文本
-            max_chunk_size: 最大chunk大小
-            separators: 分割符列表，按优先级排序
-            
+            text: 要分割的 Markdown 文本
+            max_chunk_size: 最大 chunk 大小（字节数）
+            separators: 分割符列表（备用）
+
         Returns:
             List[str]: 分割后的文本块列表
         """
-        if separators is None:
-            separators = ["\n\n", "\n", "。", "！", "？", ".", "!", "?"]
-        
-        # 预处理：清理文本中的噪声
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if not text or not text.strip():
+            return []
+
+        # 预处理
         text = self._preprocess_text(text)
-        
-        # 找出受保护的内容
-        protected_spans = self._find_protected_spans(text)
-        
-        # 构建分割单元
-        units = self._build_splitting_units(text, protected_spans, separators)
-        
-        # 合并单元成chunks
-        chunks = self._merge_units_to_chunks(units, max_chunk_size)
-        
-        # 后处理：过滤和合并短chunk
-        chunks = self._post_process_chunks(chunks)
-        
+
+        # 解析文档结构
+        elements, protected_spans = self.analyze_structure(text)
+
+        # 找出所有标题
+        headings = self._find_all_headings(text)
+
+        if not headings:
+            # 没有标题时，按段落分割
+            logger.info("无标题，使用段落分割策略")
+            return self._split_by_paragraphs(text, max_chunk_size, protected_spans)
+
+        # 按标题分割大段落
+        sections = self._split_by_headings(text, headings)
+
+        # 合并和分割每个大段落
+        chunks = []
+        for section_text, heading_level in sections:
+            if not section_text.strip():
+                continue
+
+            section_size = len(section_text.encode('utf-8'))
+
+            if section_size <= max_chunk_size:
+                # 段落足够小，直接保留
+                if section_text.strip():
+                    chunks.append(section_text.strip())
+            else:
+                # 段落太大，需要进一步分割
+                sub_chunks = self._split_large_section(
+                    section_text, max_chunk_size, protected_spans
+                )
+                chunks.extend(sub_chunks)
+
+        # 合并过短的 chunks
+        chunks = self._merge_short_chunks(chunks, max_chunk_size)
+
+        logger.info(f"Markdown 分割完成: {len(chunks)} 个 chunks")
         return chunks
+
+    def _find_all_headings(self, text: str) -> List[Tuple[int, str, int, int, int]]:
+        """找出所有标题
+
+        Returns:
+            List[Tuple[level, title, start, end, heading_end]]
+            level: 标题级别 1-6
+            title: 标题文本
+            start: 标题开始位置
+            end: 标题行结束位置（包含换行）
+            heading_end: 标题内容结束位置（下一个非空行开始）
+        """
+        headings = []
+        lines = text.split('\n')
+
+        current_pos = 0
+        for i, line in enumerate(lines):
+            # 检查是否是 Markdown 标题
+            match = re.match(r'^(#{1,6})\s+(.+)$', line.strip())
+            if match:
+                level = len(match.group(1))
+                title = match.group(2)
+                heading_line_start = current_pos
+                heading_line_end = current_pos + len(line) + 1  # +1 for \n
+                # 找到这个标题对应的内容结束位置（下一个同级或更高级标题之前）
+                content_end = self._find_section_end(lines, i, level, current_pos)
+
+                headings.append((
+                    level,
+                    title,
+                    heading_line_start,
+                    heading_line_end,
+                    content_end
+                ))
+
+            current_pos += len(line) + 1  # +1 for \n
+        # 按位置排序
+        headings.sort(key=lambda x: x[2])
+        return headings
+
+    def _find_section_end(self, lines: List[str], heading_idx: int,
+                         heading_level: int, heading_start_pos: int) -> int:
+        """找到标题对应内容的结束位置"""
+        content_end = heading_start_pos + len(lines[heading_idx]) + 1  # 从标题行结束后开始
+
+        # 跳过标题后的空行
+        for j in range(heading_idx + 1, len(lines)):
+            if lines[j].strip():
+                break
+            content_end += len(lines[j]) + 1
+
+        # 找到下一个同级或更高级标题
+        for j in range(heading_idx + 1, len(lines)):
+            line = lines[j].strip()
+            match = re.match(r'^(#{1,6})\s+(.+)$', line)
+            if match:
+                next_level = len(match.group(1))
+                if next_level <= heading_level:
+                    # 找到同级或更高级标题，内容到这里结束
+                    # content_end 是下一个标题的开始位置
+                    break
+            content_end += len(lines[j]) + 1
+
+        return content_end
+
+    def _split_by_headings(self, text: str, headings: List) -> List[Tuple[str, int]]:
+        """按标题分割文档
+
+        Returns:
+            List[Tuple[section_text, heading_level]]
+        """
+        sections = []
+
+        for i, (level, title, heading_start, heading_end, content_end) in enumerate(headings):
+            # 收集标题和内容
+            section_start = heading_start
+
+            # 确定section的结束位置
+            if i + 1 < len(headings):
+                next_heading_start = headings[i + 1][2]
+                section_end = min(content_end, next_heading_start)
+            else:
+                section_end = max(content_end, len(text))
+
+            section_text = text[section_start:section_end].strip()
+            if section_text:
+                sections.append((section_text, level))
+
+        return sections
+
+    def _split_by_paragraphs(self, text: str, max_chunk_size: int,
+                             protected_spans: List) -> List[str]:
+        """没有标题时，按段落分割"""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # 按 \n\n 分割段落
+        paragraphs = re.split(r'\n\n+', text)
+
+        chunks = []
+        current_chunk = ""
+        current_size = 0
+
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+
+            para_size = len(para.encode('utf-8'))
+
+            # 如果单个段落就超过限制，需要特殊处理
+            if para_size > max_chunk_size * 1.5:
+                # 保存当前 chunk
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+                    current_size = 0
+
+                # 直接添加超长段落（受保护内容会在后续处理）
+                chunks.append(para)
+                continue
+
+            if current_size + para_size + 2 <= max_chunk_size:  # +2 for \n\n
+                if current_chunk:
+                    current_chunk += "\n\n" + para
+                else:
+                    current_chunk = para
+                current_size += para_size + 2
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = para
+                current_size = para_size
+
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+
+        logger.info(f"按段落分割: {len(chunks)} 个 chunks")
+        return chunks
+
+    def _split_large_section(self, text: str, max_chunk_size: int,
+                            protected_spans: List) -> List[str]:
+        """分割过大的段落
+
+        策略：按段落分割，保留受保护内容完整性
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # 先处理受保护内容的边界
+        protected_ranges = [(s.start, s.end) for s in protected_spans]
+
+        # 按段落分割
+        chunks = []
+        current_chunk = ""
+        current_size = 0
+
+        # 按 \n 分割行，收集段落
+        lines = text.split('\n')
+        current_para = []
+        para_sizes = []
+
+        for line in lines:
+            line_stripped = line.strip()
+
+            # 空行表示段落结束
+            if not line_stripped:
+                if current_para:
+                    para_text = '\n'.join(current_para)
+                    para_size = len(para_text.encode('utf-8'))
+                    para_sizes.append((para_text, para_size))
+                    current_para = []
+                continue
+
+            current_para.append(line)
+
+        # 处理最后一个段落
+        if current_para:
+            para_text = '\n'.join(current_para)
+            para_size = len(para_text.encode('utf-8'))
+            para_sizes.append((para_text, para_size))
+
+        # 合并段落成 chunks
+        for para_text, para_size in para_sizes:
+            # 检查段落是否与受保护内容重叠
+            is_protected = False
+            for p_start, p_end in protected_ranges:
+                text_start = text.find(para_text)
+                if text_start >= 0:
+                    text_end = text_start + len(para_text)
+                    if not (text_end <= p_start or text_start >= p_end):
+                        is_protected = True
+                        break
+
+            if is_protected:
+                # 受保护段落：先保存当前 chunk，再单独添加
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                if para_text.strip():
+                    chunks.append(para_text.strip())
+                current_chunk = ""
+                current_size = 0
+            elif current_size + para_size + 2 <= max_chunk_size:
+                if current_chunk:
+                    current_chunk += "\n\n" + para_text
+                else:
+                    current_chunk = para_text
+                current_size += para_size + 2
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = para_text
+                current_size = para_size
+
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+
+        logger.debug(f"大段落分割: {len(chunks)} 个 sub-chunks")
+        return chunks
+
+    def _merge_short_chunks(self, chunks: List[str], max_chunk_size: int) -> List[str]:
+        """合并过短的 chunks
+
+        策略：
+        1. 纯标题 chunk（只有标题行或标题+极少内容）必须与下一个 chunk 合并
+        2. 孤立图片 chunk（只有图片引用没有上下文）必须与下一个 chunk 合并
+        3. 过短 chunk（< max_chunk_size / 4）强制与下一个合并
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if not chunks:
+            return chunks
+
+        # 阈值
+        min_threshold = max_chunk_size // 4
+        max_threshold = max_chunk_size * 2
+
+        result = []
+        i = 0
+
+        while i < len(chunks):
+            chunk = chunks[i]
+            chunk_stripped = chunk.strip()
+            if not chunk_stripped:
+                i += 1
+                continue
+
+            chunk_size = len(chunk_stripped.encode('utf-8'))
+            lines = chunk_stripped.split('\n')
+            first_line = lines[0] if lines else ""
+
+            # 判断是否是"无价值"的 chunk
+            is_heading_only = self._is_heading_only_chunk(chunk_stripped)
+            is_image_only = self._is_image_only_chunk(chunk_stripped)
+            is_too_small = chunk_size < min_threshold
+
+            # 这些情况必须与下一个 chunk 合并
+            if is_heading_only or is_image_only or is_too_small:
+                # 收集下一个或多个 chunk 来合并
+                combined = chunk_stripped
+                combined_size = chunk_size
+                j = i + 1
+
+                while j < len(chunks):
+                    next_chunk = chunks[j].strip()
+                    if not next_chunk:
+                        j += 1
+                        continue
+
+                    next_size = len(next_chunk.encode('utf-8'))
+
+                    # 如果合并后不超过最大阈值，或者下一个也是"无价值"的
+                    next_is_heading = self._is_heading_only_chunk(next_chunk)
+                    next_is_image = self._is_image_only_chunk(next_chunk)
+
+                    if combined_size + next_size + 2 <= max_threshold:
+                        combined = combined + "\n\n" + next_chunk
+                        combined_size += next_size + 2
+                        j += 1
+                    elif next_is_heading or next_is_image:
+                        # 下一个也是无价值的，强制合并
+                        combined = combined + "\n\n" + next_chunk
+                        combined_size += next_size + 2
+                        j += 1
+                    else:
+                        break
+
+                result.append(combined)
+                i = j
+            else:
+                result.append(chunk_stripped)
+                i += 1
+
+        # 最终检查：合并仍然过小的 chunks
+        final_result = []
+        for chunk in result:
+            chunk_stripped = chunk.strip()
+            if not chunk_stripped:
+                continue
+
+            chunk_size = len(chunk_stripped.encode('utf-8'))
+
+            # 如果太小，尝试与上一个合并
+            if chunk_size < min_threshold and final_result:
+                combined = final_result[-1] + "\n\n" + chunk_stripped
+                if len(combined.encode('utf-8')) <= max_threshold:
+                    final_result[-1] = combined
+                    continue
+
+            final_result.append(chunk_stripped)
+
+        logger.info(f"合并短 chunks: {len(chunks)} -> {len(final_result)}")
+        return final_result
+
+    def _is_heading_only_chunk(self, chunk: str) -> bool:
+        """判断是否是只有标题的 chunk（没有实质内容）"""
+        lines = chunk.strip().split('\n')
+        if not lines:
+            return False
+
+        first_line = lines[0].strip()
+
+        # 第一行必须是标题
+        if not first_line.startswith('#'):
+            return False
+
+        # 如果只有一行（只有标题），认为是纯标题
+        if len(lines) == 1:
+            return True
+
+        # 检查其他行是否都是空的
+        content_lines = [l for l in lines[1:] if l.strip()]
+        if not content_lines:
+            return True
+
+        # 如果内容行 <= 2 行且总内容很短（< 300 字符），认为是纯标题
+        # 这些通常是：标题 + 图注，或者标题 + 很短的引言
+        total_content_len = sum(len(l) for l in content_lines)
+        if len(content_lines) <= 2 and total_content_len < 300:
+            return True
+
+        return False
+
+    def _is_image_only_chunk(self, chunk: str) -> bool:
+        """判断是否只有图片引用没有上下文的 chunk"""
+        lines = chunk.strip().split('\n')
+        if not lines:
+            return False
+
+        # 检查是否只有图片引用行
+        image_pattern = re.compile(r'^!\[[^\]]*\]\([^)]+\)')
+        content_lines = [l for l in lines if l.strip()]
+
+        if not content_lines:
+            return False
+
+        # 如果只有 1-2 行且都是图片引用，认为是孤立图片
+        if len(content_lines) <= 2:
+            all_images = all(image_pattern.match(l.strip()) for l in content_lines)
+            if all_images:
+                return True
+
+        return False
     
     def _preprocess_text(self, text: str) -> str:
         """
-        预处理文本：清理噪声内容
+        预处理文本：清理噪声、合并断行内容
         
         处理规则：
-        1. 移除独立的 "Text" 行（MinerU的元信息标记）
-        2. 合并断行的数学公式
-        3. 清理无意义的空白
+        1. 移除独立的 "Text" 行
+        2. 合并跨行的数学公式（$...$ 可能被
+分割）
+        3. 合并跨行的图表标记（表：、图：可能单独成行）
         """
+        # 先合并所有断行的数学公式
+        # 匹配 $ ... \%$ 或 $ ... $ 模式，支持转义字符和换行
+        text = re.sub(r'\$[^\$]*(?:\\.[^\$]*)*(?:\n[^\$]*)*(?:\%$|\$)',
+                      lambda m: m.group(0).replace('\n', ' '),
+                      text)
+        
         lines = text.split('\n')
         result_lines = []
         i = 0
@@ -254,19 +661,6 @@ class DocumentStructureAnalyzer:
                 i += 1
                 continue
             
-            # 处理可能断行的数学公式（如 $ + succ$）
-            if line == '$' and i + 2 < len(lines):
-                # 检查是否是断行的数学公式
-                next_line = lines[i + 1].strip()
-                if i + 2 < len(lines):
-                    third_line = lines[i + 2].strip()
-                    if third_line.startswith('$') and len(third_line) > 1:
-                        # 合并为一行: $ + next + third$
-                        combined = '$' + next_line + third_line
-                        result_lines.append(combined)
-                        i += 3
-                        continue
-            
             result_lines.append(lines[i])
             i += 1
         
@@ -277,48 +671,148 @@ class DocumentStructureAnalyzer:
         后处理chunks：过滤噪声、合并短chunk
         
         处理规则：
+        1. 以标点符号/公式/表格标记开头 → 合并到上一个
+        2. 以不完整句子开头（括号、引号、逗号、句号等在前一个chunk末尾）→ 合并到上一个
+        3. 以不完整句子结尾（括号、引号等未闭合）→ 合并到下一个
+        4. 过短chunk → 合并到上一个或下一个
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        if not chunks:
+            return chunks
+        
+        # 定义不完整的开头字符
+        OPEN_BRACKETS = '（）【】[《》<>"\'‘’'
+
+        # 中文逗号、句号等开头的应该合并到上一个
+        TRAILING_PUNCT = ',.。!！?？…—–,，。、；：'
+        
+        # 合并相邻的短chunk
+        merged = []
+        i = 0
+        while i < len(chunks):
+            chunk = chunks[i]
+            stripped = chunk.strip()
+            if not stripped:
+                i += 1
+                continue
+            
+            # 规则1：以标点开头 → 合并到上一个
+            if stripped[0] in TRAILING_PUNCT:
+                logger.debug(f"[PostProcess] 合并标点开头: {stripped[:30]}")
+                if merged:
+                    merged[-1] = merged[-1] + stripped
+                    i += 1
+                    continue
+            
+            # 规则2：以图表标记开头 → 合并到上一个
+            if stripped.startswith(('表：', '图：', '表:', '图:')):
+                logger.debug(f"[PostProcess] 合并图表开头: {stripped[:30]}")
+                if merged:
+                    merged[-1] = merged[-1] + '\n' + stripped
+                    i += 1
+                    continue
+            
+            # 规则3：以开括号开头（如（、"、【等）→ 合并到上一个
+            if stripped[0] in OPEN_BRACKETS:
+                logger.debug(f"[PostProcess] 合并括号开头: {stripped[:30]}")
+                if merged:
+                    merged[-1] = merged[-1] + stripped
+                    i += 1
+                    continue
+            
+            merged.append(chunk)
+            i += 1
+        
+        logger.info(f"[PostProcess] 合并短尾后: {len(merged)} chunks")
+        
+        # 再次遍历：合并不完整的句子
+        # 检查当前chunk的末尾和下一个chunk的开头是否匹配
+        result = []
+        i = 0
+        while i < len(merged):
+            chunk = merged[i]
+            stripped = chunk.strip()
+            
+            if not stripped:
+                i += 1
+                continue
+            
+            # 如果当前chunk太短，尝试与下一个合并
+            if len(stripped) < 30 and i + 1 < len(merged):
+                next_chunk = merged[i + 1]
+                next_stripped = next_chunk.strip()
+                # 不要拆分表格、代码块
+                if not next_stripped.startswith('|') and not next_stripped.startswith('```'):
+                    merged_chunk = chunk + '\n' + next_chunk
+                    logger.debug(f"[PostProcess] 合并短chunk ({len(stripped)}字): {stripped[:30]}")
+                    result.append(merged_chunk)
+                    i += 2
+                    continue
+            
+            result.append(chunk)
+            i += 1
+        
+        # 最终检查：处理后仍有问题的chunk
+        still_bad = []
+        for c in result:
+            s = c.strip()
+            if s and s[0] in TRAILING_PUNCT + OPEN_BRACKETS:
+                still_bad.append((s[:50], s[-20:]))
+        if still_bad:
+            logger.warning(f"[PostProcess] 处理后仍有{len(still_bad)}个问题chunk")
+        
+        logger.info(f"[PostProcess] 最终输出: {len(result)} chunks")
+        return result
+
+    def _post_process_chunks_past(self, chunks: List[str]) -> List[str]:
+        """
+        后处理chunks：过滤噪声、合并短chunk
+
+        处理规则：
         1. 合并孤立的图片链接到上下文
         2. 过滤孤立的过短数学公式（如 $@$）
         3. 合并过短的chunk到上一个chunk
         """
         if not chunks:
             return chunks
-        
+
         # 正则模式
         image_pattern = re.compile(r'^!\[[^\]]*\]\([^)]+\)$')
         math_pattern = re.compile(r'^\$[\s\S]*?\$$')
-        
+
         processed = []
-        
+
         for chunk in chunks:
             stripped = chunk.strip()
-            
+
             # 规则1：过滤孤立且过短的图片链接
             if image_pattern.match(stripped) and len(stripped) < 200:
                 # 合并到上一个chunk
                 if processed:
                     processed[-1] = processed[-1] + "\n" + stripped
                 continue
-            
+
             # 规则2：过滤孤立的过短数学公式（如 $@$）
             if math_pattern.match(stripped) and len(stripped) < 20:
                 # 合并到上一个chunk
                 if processed:
                     processed[-1] = processed[-1] + " " + stripped
                 continue
-            
+
             processed.append(chunk)
-        
+
         # 规则3：将短标题合并到下一个chunk（标题本身没有分块价值）
         result = []
         i = 0
         while i < len(processed):
             chunk = processed[i]
             stripped = chunk.strip()
-            
+
             # 检查是否是短标题（以#开头且长度<100）
             is_short_heading = stripped.startswith('#') and len(stripped) < 100
-            
+
             if is_short_heading and i + 1 < len(processed):
                 # 短标题和下一个chunk合并
                 next_chunk = processed[i + 1]
@@ -334,17 +828,17 @@ class DocumentStructureAnalyzer:
                     result.append(chunk)
                 i += 1
                 continue
-            
+
             # 如果当前chunk太短（非标题），合并到上一个
             if len(stripped) < 50 and result:
                 if not stripped.startswith('|') and not stripped.startswith('```'):
                     result[-1] = result[-1] + "\n" + chunk
                     i += 1
                     continue
-            
+
             result.append(chunk)
             i += 1
-        
+
         return result
 
     def _build_splitting_units(self, text: str, protected_spans: List[ProtectedContentSpan], 

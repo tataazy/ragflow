@@ -28,7 +28,7 @@ class SmartChunkConfig:
                  strategy: str = "structure_aware"):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.separators = separators or ["\n\n", "\n", "。", "！", "？", ".", "!", "?"]
+        self.separators = separators or ["\n\n", "。", "！", "？", ".", "!", "?"]
         self.preserve_elements = preserve_elements or ["table", "image", "code_block", "math_block"]
         self.strategy = strategy
 
@@ -349,7 +349,8 @@ def create_smart_chunker(config_dict: Dict = None) -> SmartChunker:
         config = SmartChunkConfig(
             chunk_size=config_dict.get("chunk_size", 512),
             chunk_overlap=config_dict.get("chunk_overlap", 128),
-            separators=config_dict.get("separators", ["\n\n", "\n", "。", "！", "？"]),
+            # 不要使用 \n 作为分隔符，只用段落分隔和标点
+            separators=config_dict.get("separators", ["\n\n", "。", "！", "？"]),
             preserve_elements=config_dict.get("preserve_elements", 
                                             ["table", "image", "code_block", "math_block"]),
             strategy=config_dict.get("strategy", "structure_aware")
