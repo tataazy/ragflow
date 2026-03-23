@@ -48,8 +48,8 @@ class DocumentStructureAnalyzer:
             'link': re.compile(r'\[[^\]]*\]\([^)]+\)'),
             'table': re.compile(r'(?:\|[^\n|]+)+\|[\r\n]+(?:\|\s*:?-+:?\s*\|[\r\n]+)?(?:\|[^\n|]+\|[\r\n]+)+'),
             'code_block': re.compile(r'```[\s\S]*?```'),
-            # HTML 表格 (mineru 输出格式)
-            'html_table': re.compile(r'<table>[\s\S]*?</table>', re.DOTALL),
+            # HTML 表格 (mineru 输出格式) - 使用 (?s) 启用 DOTALL 模式
+            'html_table': re.compile(r'(?s)<table>.*?</table>'),
             'inline_code': re.compile(r'`[^`]+`'),
             # 数学公式：$...\%$ 或 $...$ (mineru输出格式如 $3 . 1 \%$)，支持多行
             # 关键：不要让 [^$] 匹配 \%，否则 \%$ 会被分开
@@ -241,6 +241,9 @@ class DocumentStructureAnalyzer:
             logger.info("无标题，使用段落分割策略")
             return self._split_by_paragraphs(text, max_chunk_size, protected_spans)
 
+        # 保存 max_chunk_size 供 _split_by_headings 使用
+        self._current_max_chunk_size = max_chunk_size
+
         # 按标题分割大段落
         sections = self._split_by_headings(text, headings)
 
@@ -272,6 +275,10 @@ class DocumentStructureAnalyzer:
     def _find_all_headings(self, text: str) -> List[Tuple[int, str, int, int, int]]:
         """找出所有标题
 
+        处理规则：
+        1. 识别 Markdown 标题 (# 开头)
+        2. 同一行有多个标题时，每个标题都单独识别
+
         Returns:
             List[Tuple[level, title, start, end, heading_end]]
             level: 标题级别 1-6
@@ -281,82 +288,286 @@ class DocumentStructureAnalyzer:
             heading_end: 标题内容结束位置（下一个非空行开始）
         """
         headings = []
+        
         lines = text.split('\n')
-
         current_pos = 0
+        
         for i, line in enumerate(lines):
-            # 检查是否是 Markdown 标题
-            match = re.match(r'^(#{1,6})\s+(.+)$', line.strip())
-            if match:
-                level = len(match.group(1))
-                title = match.group(2)
-                heading_line_start = current_pos
-                heading_line_end = current_pos + len(line) + 1  # +1 for \n
-                # 找到这个标题对应的内容结束位置（下一个同级或更高级标题之前）
-                content_end = self._find_section_end(lines, i, level, current_pos)
-
-                headings.append((
-                    level,
-                    title,
-                    heading_line_start,
-                    heading_line_end,
-                    content_end
-                ))
-
+            stripped_line = line.strip()
+            
+            # 检查是否是 Markdown 标题行（可能包含多个标题）
+            if stripped_line.startswith('#'):
+                # 简化处理：直接用正则匹配行内所有标题
+                # 匹配格式: # 到下一个 # (或行尾) 之间的内容
+                heading_pattern = re.compile(r'(#{1,6})\s+(.+?)(?=\s*#{1,6}\s+|\s*$)')
+                
+                matches = list(heading_pattern.finditer(stripped_line))
+                
+                for match in matches:
+                    level = len(match.group(1))  # 级别就是 # 的数量
+                    title_content = match.group(2).strip()
+                    
+                    # 跳过空标题
+                    if not title_content:
+                        continue
+                    
+                    # 计算在原始文本中的位置
+                    leading_space = len(line) - len(line.lstrip())
+                    heading_in_line_start = match.start(2)  # 标题内容开始位置
+                    heading_line_start = current_pos + leading_space + heading_in_line_start
+                    heading_line_end = current_pos + len(line) + 1  # 行结束位置
+                    
+                    # 找到这个标题对应的内容结束位置
+                    content_end = self._find_section_end(lines, i, level, current_pos + leading_space)
+                    
+                    headings.append((
+                        level,
+                        title_content,
+                        heading_line_start,
+                        heading_line_end,
+                        content_end
+                    ))
+            
             current_pos += len(line) + 1  # +1 for \n
         # 按位置排序
         headings.sort(key=lambda x: x[2])
         return headings
 
     def _find_section_end(self, lines: List[str], heading_idx: int,
-                         heading_level: int, heading_start_pos: int) -> int:
-        """找到标题对应内容的结束位置"""
-        content_end = heading_start_pos + len(lines[heading_idx]) + 1  # 从标题行结束后开始
+                         heading_level: int, heading_start_pos: int,
+                         processed_text: str = None) -> int:
+        """找到标题对应内容的结束位置
+
+        返回内容：标题结束后到下一个同级/更高级标题开始之间的位置
+        """
+        # 内容从标题结束后开始
+        content_end = heading_start_pos + len(lines[heading_idx])
 
         # 跳过标题后的空行
-        for j in range(heading_idx + 1, len(lines)):
-            if lines[j].strip():
-                break
-            content_end += len(lines[j]) + 1
+        j = heading_idx + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
 
-        # 找到下一个同级或更高级标题
-        for j in range(heading_idx + 1, len(lines)):
+        # 对于1级标题，只找下一个1级或更高级标题
+        # 对于其他级别的标题，找同级或更高级标题
+        target_level = 1 if heading_level == 1 else heading_level
+
+        # 遍历后续行，找到下一个边界标题
+        while j < len(lines):
             line = lines[j].strip()
             match = re.match(r'^(#{1,6})\s+(.+)$', line)
             if match:
                 next_level = len(match.group(1))
-                if next_level <= heading_level:
-                    # 找到同级或更高级标题，内容到这里结束
-                    # content_end 是下一个标题的开始位置
+                if next_level <= target_level:
+                    # 找到边界标题，content_end 是这个标题的开始位置
                     break
+            # 不是边界，累加这一行长度 + 换行符(1)
             content_end += len(lines[j]) + 1
+            j += 1
 
         return content_end
 
     def _split_by_headings(self, text: str, headings: List) -> List[Tuple[str, int]]:
         """按标题分割文档
 
+        策略：
+        1. 如果多个标题连续出现（之间没有内容），合并到最后一个
+        2. 每个有内容的 section 形成一个 chunk
+        3. 如果标题后包含"混合"内容（表格+文本），在表格结束后创建独立 chunk
+
         Returns:
             List[Tuple[section_text, heading_level]]
         """
         sections = []
 
-        for i, (level, title, heading_start, heading_end, content_end) in enumerate(headings):
-            # 收集标题和内容
-            section_start = heading_start
+        if not headings:
+            return sections
+
+        # 预处理：合并连续的标题
+        merged_headings = self._merge_consecutive_headings(text, headings)
+
+        i = 0
+        while i < len(merged_headings):
+            level, title, heading_start, heading_end, content_end = merged_headings[i]
 
             # 确定section的结束位置
-            if i + 1 < len(headings):
-                next_heading_start = headings[i + 1][2]
-                section_end = min(content_end, next_heading_start)
+            if i + 1 < len(merged_headings):
+                next_heading_start = merged_headings[i + 1][2]
             else:
-                section_end = max(content_end, len(text))
+                next_heading_start = len(text)
 
-            section_text = text[section_start:section_end].strip()
+            # 检查标题后面到下一个同级标题之间的内容是否有"混合"（表格+文本）
+            # 注意：使用 heading_end 而不是 content_end
+            section_end = min(content_end, next_heading_start)
+            between_content = text[heading_end:next_heading_start]
+            has_table = '<table>' in between_content and '</table>' in between_content
+
+            if has_table:
+                # 检查表格后面是否有内容
+                table_end_in_between = between_content.find('</table>') + len('</table>')
+                after_table = between_content[table_end_in_between:]
+
+                # 如果表格后面有非标题内容
+                stripped_after = after_table.strip()
+                if stripped_after:
+                    # 检查 after_table 中是否包含 Markdown 标题
+                    has_heading_in_after = '\n# ' in after_table or after_table.startswith('# ')
+
+                    if not has_heading_in_after:
+                        # after_table 中没有标题
+                        # 计算表格部分和文本部分的大小
+                        table_part_size = len(between_content[:table_end_in_between].strip().encode('utf-8'))
+                        text_part_size = len(stripped_after.encode('utf-8'))
+
+                        # 如果表格+文本总大小不超过 max_chunk_size * 1.5，合并在一起
+                        # 否则才分开创建 chunks
+                        combined_size = table_part_size + text_part_size
+                        if combined_size < self._get_max_chunk_size() * 1.5:
+                            # 合并：表格和文本一起作为当前标题的内容
+                            section_end = heading_end + table_end_in_between
+                            section_text = text[heading_start:section_end].strip()
+                            if section_text:
+                                sections.append((section_text, level))
+                            i += 1
+                            continue
+                        else:
+                            # 表格后的文本较长且表格+文本总大小较大，创建独立 chunk
+                            section_end = heading_end + table_end_in_between
+                            section_text = text[heading_start:section_end].strip()
+                            if section_text:
+                                sections.append((section_text, level))
+                            # 表格后的文本作为独立 chunk
+                            if stripped_after:
+                                sections.append((stripped_after, 0))
+                            i += 1
+                            continue
+                    # 有标题在 after_table 中，不做特殊处理，正常分配
+
+            section_text = text[heading_start:section_end].strip()
             if section_text:
                 sections.append((section_text, level))
 
+            i += 1
+
         return sections
+
+    def config(self):
+        """获取配置（兼容属性访问）"""
+        return getattr(self, '_config', {'max_chunk_size': 512})
+
+    def _get_max_chunk_size(self):
+        """获取当前分割的最大chunk大小"""
+        return getattr(self, '_current_max_chunk_size', 512)
+
+    def _merge_consecutive_headings(self, text: str, headings: List) -> List:
+        """合并连续的标题（标题之间没有内容）
+
+        如果多个标题连续出现，将它们合并到最后一个有实际内容的标题。
+        如果标题后只有表格（无文本），不合并后面的标题。
+        """
+        if not headings:
+            return headings
+
+        merged = []
+        consecutive_group = []
+
+        for i, heading in enumerate(headings):
+            level, title, heading_start, heading_end, content_end = heading
+
+            # 检查这个标题后面是否有内容
+            has_content, content_type = self._heading_has_content(text, heading, headings, i)
+
+            if has_content:
+                # 如果只有表格，不合并后面的标题，单独处理
+                if content_type == 'table':
+                    # 只有表格，表格作为独立 chunk，不合并后续标题
+                    section_text = text[heading_start:content_end].strip()
+                    if section_text:
+                        merged.append(heading)
+                    # 清空连续标题组（不合并）
+                    consecutive_group = []
+                else:
+                    # 有文本内容（包括混合），处理之前的连续标题组
+                    if consecutive_group:
+                        merged_heading = self._merge_heading_group(text, consecutive_group, heading)
+                        merged.append(merged_heading)
+                        consecutive_group = []
+                    merged.append(heading)
+            else:
+                consecutive_group.append(heading)
+
+        # 处理最后一组连续标题
+        if consecutive_group and merged:
+            last_heading = merged[-1]
+            merged[-1] = self._merge_heading_group(text, consecutive_group, last_heading)
+        elif consecutive_group:
+            merged.extend(consecutive_group)
+
+        return merged
+
+    def _heading_has_content(self, text: str, heading, all_headings: List, heading_idx: int) -> Tuple[bool, str]:
+        """检查标题后面是否有实际内容（非其他标题）
+
+        Returns:
+            Tuple[has_content, content_type]: content_type 可以是 'none', 'text', 'table', 'mixed'
+        """
+        level, title, heading_start, heading_end, content_end = heading
+
+        # 获取下一个标题的开始位置
+        if heading_idx + 1 < len(all_headings):
+            next_heading_start = all_headings[heading_idx + 1][2]
+        else:
+            next_heading_start = len(text)
+
+        # 检查标题行结束后到下一个标题开始之间的内容
+        # 注意：使用 heading_end（标题行结束）而不是 content_end
+        between_content = text[heading_end:next_heading_start]
+
+        # 检查是否有表格
+        has_table = '<table>' in between_content and '</table>' in between_content
+
+        # 检查是否有非标题、非表格的内容
+        lines = between_content.split('\n')
+        non_heading_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith('#'):
+                continue
+            # 检查是否是图片引用、代码块、数学公式等（跳过）
+            if stripped.startswith('![') or stripped.startswith('```') or stripped.startswith('$') or stripped.startswith('来源：'):
+                continue
+            non_heading_lines.append(stripped)
+
+        total_len = sum(len(l) for l in non_heading_lines)
+
+        if has_table and total_len > 50:
+            # 标题后面既有表格又有文本，这是"混合"内容
+            return True, 'mixed'
+        elif has_table:
+            # 只有表格，视为有内容（表格本身是有效内容）
+            return True, 'table'
+        elif total_len > 50:
+            # 只有文本内容
+            return True, 'text'
+        else:
+            return False, 'none'
+
+    def _merge_heading_group(self, text: str, heading_group: List, target_heading: List) -> List:
+        """将标题组合并到目标标题"""
+        if not heading_group:
+            return target_heading
+
+        target_level, target_title, target_start, target_end, target_content_end = target_heading
+
+        # 找到组中最小的开始位置
+        min_start = min(h[2] for h in heading_group)
+        # 找到组中最大的结束位置
+        max_end = max(h[3] for h in heading_group)
+
+        # 返回合并后的标题（保留目标的层级和标题，但使用组合的范围）
+        return [target_level, target_title, min_start, max_end, target_content_end]
 
     def _split_by_paragraphs(self, text: str, max_chunk_size: int,
                              protected_spans: List) -> List[str]:
@@ -451,7 +662,7 @@ class DocumentStructureAnalyzer:
             para_sizes.append((para_text, para_size))
 
         # 合并段落成 chunks
-        for para_text, para_size in para_sizes:
+        for idx, (para_text, para_size) in enumerate(para_sizes):
             # 检查段落是否与受保护内容重叠
             is_protected = False
             for p_start, p_end in protected_ranges:
@@ -461,15 +672,39 @@ class DocumentStructureAnalyzer:
                     if not (text_end <= p_start or text_start >= p_end):
                         is_protected = True
                         break
-
+            
             if is_protected:
-                # 受保护段落：先保存当前 chunk，再单独添加
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                if para_text.strip():
-                    chunks.append(para_text.strip())
-                current_chunk = ""
-                current_size = 0
+                # 检查 current_chunk 是否是标题（以 # 开头）
+                current_is_heading = current_chunk.strip().startswith('#') if current_chunk else False
+                
+                # 如果当前chunk是标题，且当前处理的受保护段落是表格，则将标题和表格合并
+                if current_is_heading:
+                    # 把受保护的表格与标题合并成一个chunk
+                    combined = current_chunk.strip() + "\n\n" + para_text.strip()
+                    combined_size = len(combined.encode('utf-8'))
+                    
+                    # 如果合并后不太大（<= max_chunk_size * 1.5），合并在一起
+                    if combined_size <= max_chunk_size * 1.5:
+                        chunks.append(combined)
+                        current_chunk = ""
+                        current_size = 0
+                        continue
+                    else:
+                        # 合并后太大，但表格是受保护内容，必须保持完整
+                        # 将标题+表格+后续内容作为一个大chunk处理
+                        # 保存标题后，继续累积到 current_chunk（包含表格）
+                        chunks.append(current_chunk.strip())
+                        current_chunk = para_text.strip()  # 只保存表格
+                        current_size = len(para_text.strip().encode('utf-8'))
+                        continue
+                else:
+                    # 不是标题：先保存当前 chunk，再单独添加受保护的段落
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    if para_text.strip():
+                        chunks.append(para_text.strip())
+                    current_chunk = ""
+                    current_size = 0
             elif current_size + para_size + 2 <= max_chunk_size:
                 if current_chunk:
                     current_chunk += "\n\n" + para_text
@@ -488,13 +723,36 @@ class DocumentStructureAnalyzer:
         logger.debug(f"大段落分割: {len(chunks)} 个 sub-chunks")
         return chunks
 
+    def _is_table_only_chunk(self, chunk: str) -> bool:
+        """判断是否是只有表格的 chunk（标题+表格，没有其他文本内容）"""
+        stripped = chunk.strip()
+        if '<table>' not in stripped or '</table>' not in stripped:
+            return False
+
+        # 移除表格标签和内容
+        import re
+        without_table = re.sub(r'<table>[\s\S]*?</table>', '', stripped)
+        without_table = without_table.strip()
+
+        # 如果除了表格外还有其他内容（超过50字符），就不是纯表格
+        if len(without_table) > 50:
+            return False
+
+        return True
+
+    def _has_table(self, chunk: str) -> bool:
+        """判断chunk是否包含表格"""
+        return '<table>' in chunk and '</table>' in chunk
+
     def _merge_short_chunks(self, chunks: List[str], max_chunk_size: int) -> List[str]:
         """合并过短的 chunks
 
         策略：
-        1. 纯标题 chunk（只有标题行或标题+极少内容）必须与下一个 chunk 合并
-        2. 孤立图片 chunk（只有图片引用没有上下文）必须与下一个 chunk 合并
-        3. 过短 chunk（< max_chunk_size / 4）强制与下一个合并
+        1. 纯表格 chunk 与上一个有内容的 chunk 合并
+        2. 纯标题 chunk（只有标题行）必须与下一个 chunk 合并
+        3. 孤立图片 chunk 必须与下一个 chunk 合并
+        4. 过短 chunk（< max_chunk_size / 4）强制与下一个合并
+        5. 避免将多个包含表格的chunks合并成一个过大的chunk
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -518,18 +776,34 @@ class DocumentStructureAnalyzer:
 
             chunk_size = len(chunk_stripped.encode('utf-8'))
             lines = chunk_stripped.split('\n')
-            first_line = lines[0] if lines else ""
+            chunk_has_table = self._has_table(chunk_stripped)
 
-            # 判断是否是"无价值"的 chunk
+            # 判断是否是特殊类型的 chunk
             is_heading_only = self._is_heading_only_chunk(chunk_stripped)
             is_image_only = self._is_image_only_chunk(chunk_stripped)
+            is_table_only = self._is_table_only_chunk(chunk_stripped)
             is_too_small = chunk_size < min_threshold
+
+            # 纯表格 chunk 与上一个 chunk 合并
+            if is_table_only and result:
+                # 检查前一个chunk是否也包含表格，如果是则不合并（避免多个表格合并）
+                prev_has_table = self._has_table(result[-1])
+                combined = result[-1] + "\n\n" + chunk_stripped
+                combined_size = len(combined.encode('utf-8'))
+                # 只有当前一个chunk不包含表格，且合并后不超过阈值时才合并
+                if not prev_has_table and combined_size <= max_threshold:
+                    result[-1] = combined
+                else:
+                    result.append(chunk_stripped)
+                i += 1
+                continue
 
             # 这些情况必须与下一个 chunk 合并
             if is_heading_only or is_image_only or is_too_small:
                 # 收集下一个或多个 chunk 来合并
                 combined = chunk_stripped
                 combined_size = chunk_size
+                combined_has_table = chunk_has_table
                 j = i + 1
 
                 while j < len(chunks):
@@ -539,19 +813,41 @@ class DocumentStructureAnalyzer:
                         continue
 
                     next_size = len(next_chunk.encode('utf-8'))
+                    next_has_table = self._has_table(next_chunk)
 
-                    # 如果合并后不超过最大阈值，或者下一个也是"无价值"的
+                    # 如果是纯表格，不能跳过，必须保留在结果中
+                    # 将已收集的内容先保存，然后单独添加纯表格chunk
+                    if self._is_table_only_chunk(next_chunk):
+                        # 先保存已收集的内容
+                        if combined.strip():
+                            result.append(combined)
+                        # 单独添加纯表格chunk
+                        result.append(next_chunk)
+                        # 重置，继续收集后续chunks
+                        combined = ""
+                        combined_size = 0
+                        combined_has_table = False
+                        j += 1
+                        continue
+
+                    # 如果下一个chunk包含表格，且当前已合并的内容也包含表格
+                    # 则不继续合并（避免表格+文本+表格的情况）
+                    if next_has_table and combined_has_table:
+                        break
+
                     next_is_heading = self._is_heading_only_chunk(next_chunk)
                     next_is_image = self._is_image_only_chunk(next_chunk)
 
                     if combined_size + next_size + 2 <= max_threshold:
                         combined = combined + "\n\n" + next_chunk
                         combined_size += next_size + 2
+                        combined_has_table = combined_has_table or next_has_table
                         j += 1
                     elif next_is_heading or next_is_image:
                         # 下一个也是无价值的，强制合并
                         combined = combined + "\n\n" + next_chunk
                         combined_size += next_size + 2
+                        combined_has_table = combined_has_table or next_has_table
                         j += 1
                     else:
                         break
@@ -570,11 +866,15 @@ class DocumentStructureAnalyzer:
                 continue
 
             chunk_size = len(chunk_stripped.encode('utf-8'))
+            chunk_has_table = self._has_table(chunk_stripped)
 
             # 如果太小，尝试与上一个合并
             if chunk_size < min_threshold and final_result:
+                prev_has_table = self._has_table(final_result[-1])
                 combined = final_result[-1] + "\n\n" + chunk_stripped
-                if len(combined.encode('utf-8')) <= max_threshold:
+                combined_size = len(combined.encode('utf-8'))
+                # 只有当前一个chunk不包含表格，或合并后不超过阈值时才合并
+                if (not prev_has_table and not chunk_has_table) or combined_size <= max_threshold:
                     final_result[-1] = combined
                     continue
 

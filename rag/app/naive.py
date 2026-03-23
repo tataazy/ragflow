@@ -752,7 +752,9 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
 
     is_english = lang.lower() == "english"  # is_english(cks)
     parser_config = kwargs.get("parser_config", {"chunk_token_num": 512, "delimiter": "\n!?。；！？", "layout_recognize": "DeepDOC", "analyze_hyperlink": True})
-    
+
+    #logging.info(f"parser_config: {parser_config}")
+
     # 智能分割配置
     use_smart_chunking = parser_config.get("use_smart_chunking", True)
     if use_smart_chunking:
@@ -875,21 +877,21 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
         )
         
         # 添加详细的调试日志
-        logging.info(f"[DEBUG] 解析器 {name} 返回值数量: {len(parser_result)}")
-        logging.info(f"[DEBUG] 解析器返回值类型: {[type(item).__name__ for item in parser_result]}")
+        # logging.info(f"[DEBUG] 解析器 {name} 返回值数量: {len(parser_result)}")
+        # logging.info(f"[DEBUG] 解析器返回值类型: {[type(item).__name__ for item in parser_result]}")
         
         # 根据返回值数量进行解包（兼容不同解析器）
         if len(parser_result) == 4:
             sections, tables, section_images, pdf_parser = parser_result
-            logging.info(f"[DEBUG] 4值解包完成 - sections: {len(sections)}, tables: {len(tables)}, section_images: {len(section_images) if section_images else 0}")
+            #logging.info(f"[DEBUG] 4值解包完成 - sections: {len(sections)}, tables: {len(tables)}, section_images: {len(section_images) if section_images else 0}")
             if section_images:
                 non_none_images = len([img for img in section_images if img is not None])
-                logging.info(f"[DEBUG] section_images中非None图片: {non_none_images}")
-                logging.info(f"[DEBUG] section_images前5个元素类型: {[type(img).__name__ if img is not None else 'None' for img in section_images[:5]]}")
+                # logging.info(f"[DEBUG] section_images中非None图片: {non_none_images}")
+                # logging.info(f"[DEBUG] section_images前5个元素类型: {[type(img).__name__ if img is not None else 'None' for img in section_images[:5]]}")
         elif len(parser_result) == 3:
             sections, tables, pdf_parser = parser_result
             section_images = None  # 其他解析器不支持图片信息
-            logging.info(f"[DEBUG] 3值解包完成 - sections: {len(sections)}, tables: {len(tables)}, section_images: None")
+            #logging.info(f"[DEBUG] 3值解包完成 - sections: {len(sections)}, tables: {len(tables)}, section_images: None")
         else:
             error_msg = f"Unexpected parser return value count: {len(parser_result)}"
             logging.error(f"[DEBUG] {error_msg}")
@@ -1109,22 +1111,22 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
         has_images = merged_images and any(img is not None for img in merged_images)
         
         # 添加最终决策的详细日志
-        logging.info(f"[DEBUG] 最终决策点:")
-        logging.info(f"[DEBUG]   merged_chunks数量: {len(merged_chunks)}")
-        logging.info(f"[DEBUG]   merged_images数量: {len(merged_images)}")
-        logging.info(f"[DEBUG]   has_images: {has_images}")
+        # logging.info(f"[DEBUG] 最终决策点:")
+        # logging.info(f"[DEBUG]   merged_chunks数量: {len(merged_chunks)}")
+        # logging.info(f"[DEBUG]   merged_images数量: {len(merged_images)}")
+        # logging.info(f"[DEBUG]   has_images: {has_images}")
         
         if merged_images:
             final_non_none = len([img for img in merged_images if img is not None])
             logging.info(f"[DEBUG]   最终非None图片数量: {final_non_none}")
-            logging.info(f"[DEBUG]   最终图片类型分布: {[type(img).__name__ if img is not None else 'None' for img in merged_images]}")
+            #logging.info(f"[DEBUG]   最终图片类型分布: {[type(img).__name__ if img is not None else 'None' for img in merged_images]}")
             
             # 特别检查为什么has_images可能是False
             if final_non_none > 0 and not has_images:
-                logging.error(f"[DEBUG] 警告: 检测到矛盾 - 有{final_non_none}个非None图片但has_images为False")
+                #logging.error(f"[DEBUG] 警告: 检测到矛盾 - 有{final_non_none}个非None图片但has_images为False")
                 # 强制设置为True进行调试
                 has_images = True
-                logging.info(f"[DEBUG] 强制设置has_images为True进行调试")
+                #logging.info(f"[DEBUG] 强制设置has_images为True进行调试")
 
         if has_images:
             logging.info(f"[DEBUG] 选择tokenize_chunks_with_images路径处理带图片内容")
@@ -1142,8 +1144,8 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
             logging.info(f"[DEBUG] 开始处理带图片的sections合并...")
             logging.info(f"[DEBUG] sections数量: {len(sections)}")
             logging.info(f"[DEBUG] section_images数量: {len(section_images)}")
-            non_none_count = len([img for img in section_images if img is not None])
-            logging.info(f"[DEBUG] 非None图片数量: {non_none_count}")
+            # non_none_count = len([img for img in section_images if img is not None])
+            # logging.info(f"[DEBUG] 非None图片数量: {non_none_count}")
             
             if use_smart_chunking and smart_chunker:
                 logging.info(f"[DEBUG] 使用智能分割处理带图片内容")

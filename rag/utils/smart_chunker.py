@@ -379,8 +379,8 @@ def smart_merge(sections: Union[str, List], chunk_token_num=128,
     """
     # 创建配置
     config = SmartChunkConfig(
-        chunk_size=chunk_token_num * 4,  # 估算：1 token ≈ 4 bytes
-        chunk_overlap=int(chunk_token_num * overlapped_percent / 100 * 4),
+        chunk_size=chunk_token_num * 3,  # 估算：1 token ≈ 4 bytes
+        chunk_overlap=int(chunk_token_num * overlapped_percent / 100 * 3),
         separators=[d for d in delimiter] if isinstance(delimiter, str) else delimiter
     )
     
@@ -405,7 +405,7 @@ def smart_merge(sections: Union[str, List], chunk_token_num=128,
     chunks = chunker.split_document(content, content_type)
     
     # 如果chunks太少或太多，可以调整策略
-    target_chunks = max(10, min(200, len(chunks) * 2))  # 目标chunk数量范围
+    # target_chunks = max(10, min(200, len(chunks) * 2))  # 目标chunk数量范围
     
     return chunks
 
@@ -427,14 +427,14 @@ def smart_merge_with_images(texts, images, chunk_token_num=128,
         Tuple[List[str], List]: (文本chunks, 图片chunks)
     """
     config = SmartChunkConfig(
-        chunk_size=chunk_token_num * 4,
-        chunk_overlap=int(chunk_token_num * overlapped_percent / 100 * 4),
+        chunk_size=chunk_token_num * 3,
+        chunk_overlap=int(chunk_token_num * overlapped_percent / 100 * 3),
         separators=[d for d in delimiter] if isinstance(delimiter, str) else delimiter
     )
     
     chunker = SmartChunker(config)
-    return chunker.split_with_images(texts, images, chunk_token_num * 4, 
-                                   int(chunk_token_num * overlapped_percent / 100 * 4))
+    return chunker.split_with_images(texts, images, chunk_token_num * 3,
+                                   int(chunk_token_num * overlapped_percent / 100 * 3))
 
 
 def test_smart_chunker():

@@ -774,11 +774,11 @@ class MinerUParser(RAGFlowPdfParser):
         replaced_count = 0
         
         # 调试：检查 image_mapping 的内容
-        logger.info(f"[MinerU] [DEBUG] image_mapping 大小: {len(image_mapping)}")
-        if image_mapping:
-            sample_keys = list(image_mapping.keys())[:3]
-            logger.info(f"[MinerU] [DEBUG] image_mapping 键样本: {sample_keys}")
-            logger.info(f"[MinerU] [DEBUG] 第一个键长度: {len(sample_keys[0]) if sample_keys else 0}")
+        # logger.info(f"[MinerU] [DEBUG] image_mapping 大小: {len(image_mapping)}")
+        # if image_mapping:
+        #     sample_keys = list(image_mapping.keys())[:3]
+        #     logger.info(f"[MinerU] [DEBUG] image_mapping 键样本: {sample_keys}")
+        #     logger.info(f"[MinerU] [DEBUG] 第一个键长度: {len(sample_keys[0]) if sample_keys else 0}")
 
         def replace_img_ref(match):
             nonlocal replaced_count
@@ -810,8 +810,8 @@ class MinerUParser(RAGFlowPdfParser):
         logger.info(f"[MinerU] 更新后markdown长度: {len(updated_md)} 字符")
 
         # 打印替换后的markdown样本（用于调试）
-        sample_updated = updated_md[:500] if updated_md else ""
-        logger.info(f"[MinerU] 更新后markdown样本（前500字符）: {sample_updated}")
+        # sample_updated = updated_md[:500] if updated_md else ""
+        # logger.info(f"[MinerU] 更新后markdown样本（前500字符）: {sample_updated}")
 
         logger.info(f"[MinerU] ========== upload_and_replace_images_in_markdown 结束 ==========")
 
@@ -823,10 +823,13 @@ class MinerUParser(RAGFlowPdfParser):
         self.page_from = page_from
         self.page_to = page_to
         try:
-            with pdfplumber.open(fnm) if isinstance(fnm, (str, PathLike)) else pdfplumber.open(BytesIO(fnm)) as pdf:
-                self.pdf = pdf
-                self.page_images = [p.to_image(resolution=72 * zoomin, antialias=True).original for _, p in
-                                    enumerate(self.pdf.pages[page_from:page_to])]
+            # 使用全局锁保护非线程安全的pdfplumber操作
+            lock = sys.modules.get(LOCK_KEY_pdfplumber)
+            with lock if lock else threading.Lock():
+                with pdfplumber.open(fnm) if isinstance(fnm, (str, PathLike)) else pdfplumber.open(BytesIO(fnm)) as pdf:
+                    self.pdf = pdf
+                    self.page_images = [p.to_image(resolution=72 * zoomin, antialias=True).original for _, p in
+                                        enumerate(self.pdf.pages[page_from:page_to])]
         except Exception as e:
             self.page_images = None
             self.total_page = 0
