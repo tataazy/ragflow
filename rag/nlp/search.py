@@ -864,6 +864,9 @@ class Dealer:
             doc_id2kb_id[ck["doc_id"]] = ck["kb_id"]
         doc_id = sorted(ranks.items(), key=lambda x: x[1] * -1.)[0][0]
         kb_ids = [doc_id2kb_id[doc_id]]
+        
+        logging.info(f"[TOC] retrieval_by_toc - Query: '{query[:50]}...', Doc: {doc_id}, TopN: {topn}")
+        
         es_res = self.dataStore.search(["content_with_weight"], [], {"doc_id": doc_id, "toc_kwd": "toc"}, [],
                                        OrderByExpr(), 0, 128, idx_nms,
                                        kb_ids)
@@ -873,12 +876,23 @@ class Dealer:
             try:
                 toc.extend(json.loads(doc["content_with_weight"]))
             except Exception as e:
-                logging.exception(e)
+                logging.exception(f"[TOC] Failed to parse TOC chunk: {e}")
+        
+        logging.info(f"[TOC] retrieval_by_toc - Loaded {len(toc)} TOC entries from {len(dict_chunks)} chunks")
+        
         if not toc:
+            logging.warning(f"[TOC] retrieval_by_toc - No TOC found for doc {doc_id}, skipping enhancement")
             return chunks
 
-        ids = await relevant_chunks_with_toc(query, toc, chat_mdl, topn * 2)
+        try:
+            ids = await relevant_chunks_with_toc(query, toc, chat_mdl, topn * 2)
+            logging.info(f"[TOC] retrieval_by_toc - Got {len(ids)} relevant chunk IDs from TOC")
+        except Exception as e:
+            logging.exception(f"[TOC] retrieval_by_toc - relevant_chunks_with_toc failed: {e}")
+            return chunks
+            
         if not ids:
+            logging.warning(f"[TOC] retrieval_by_toc - No relevant chunks found via TOC")
             return chunks
 
         vector_size = 1024

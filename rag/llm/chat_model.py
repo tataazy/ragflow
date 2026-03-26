@@ -64,9 +64,18 @@ LENGTH_NOTIFICATION_EN = "...\nThe answer is truncated by your chosen LLM due to
 
 class Base(ABC):
     def __init__(self, key, model_name, base_url, **kwargs):
-        timeout = int(os.environ.get("LLM_TIMEOUT_SECONDS", 600))
-        self.client = OpenAI(api_key=key, base_url=base_url, timeout=timeout)
-        self.async_client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=timeout)
+        import httpx
+        # Fine-grained timeout control: connect=10s, read=180s, write=30s, pool=5s
+        # Increase read timeout to allow slow model servers (e.g., TOC relevance evaluation)
+        timeout = httpx.Timeout(
+            connect=10.0,
+            read=float(os.environ.get("LLM_READ_TIMEOUT_SECONDS", 180)),
+            write=60.0,
+            pool=5.0
+        )
+        # Disable OpenAI client internal retries, use RAGFlow's retry logic instead
+        self.client = OpenAI(api_key=key, base_url=base_url, timeout=timeout, max_retries=0)
+        self.async_client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=timeout, max_retries=0)
         self.model_name = model_name
         # Configure retry parameters
         self.max_retries = kwargs.get("max_retries", int(os.environ.get("LLM_MAX_RETRIES", 5)))
@@ -137,7 +146,7 @@ class Base(ABC):
         return gen_conf
 
     async def _async_chat_streamly(self, history, gen_conf, **kwargs):
-        logging.info("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
+        #logging.info("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
         reasoning_start = False
 
         request_kwargs = {"model": self.model_name, "messages": history, "stream": True, **gen_conf}
@@ -443,7 +452,7 @@ class Base(ABC):
         assert False, "Shouldn't be here."
 
     async def _async_chat(self, history, gen_conf, **kwargs):
-        logging.info("[HISTORY]" + json.dumps(history, ensure_ascii=False, indent=2))
+        #logging.info("[HISTORY]" + json.dumps(history, ensure_ascii=False, indent=2))
         if self.model_name.lower().find("qwq") >= 0:
             logging.info(f"[INFO] {self.model_name} detected as reasoning model, using async_chat_streamly")
 
@@ -1269,7 +1278,7 @@ class LiteLLMBase(ABC):
             if not hist or hist[0].get("role") != "system":
                 hist.insert(0, {"role": "system", "content": system})
 
-        logging.info("[HISTORY]" + json.dumps(hist, ensure_ascii=False, indent=2))
+        #logging.info("[HISTORY]" + json.dumps(hist, ensure_ascii=False, indent=2))
         if self.model_name.lower().find("qwen3") >= 0:
             kwargs["extra_body"] = {"enable_thinking": False}
 
@@ -1300,7 +1309,7 @@ class LiteLLMBase(ABC):
     async def async_chat_streamly(self, system, history, gen_conf, **kwargs):
         if system and history and history[0].get("role") != "system":
             history.insert(0, {"role": "system", "content": system})
-        logging.info("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
+        #logging.info("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
         gen_conf = self._clean_conf(gen_conf)
         reasoning_start = False
         total_tokens = 0

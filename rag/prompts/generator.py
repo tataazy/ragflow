@@ -485,7 +485,7 @@ async def gen_meta_filter(chat_mdl, meta_data: dict, query: str) -> dict:
     return {"conditions": []}
 
 
-async def gen_json(system_prompt: str, user_prompt: str, chat_mdl, gen_conf={}, max_retry=2):
+async def gen_json(system_prompt: str, user_prompt: str, chat_mdl, gen_conf={}, max_retry=2, context=""):
     from graphrag.utils import get_llm_cache, set_llm_cache
     cached = get_llm_cache(chat_mdl.llm_name, system_prompt, user_prompt, gen_conf)
     if cached:
@@ -493,31 +493,89 @@ async def gen_json(system_prompt: str, user_prompt: str, chat_mdl, gen_conf={}, 
     _, msg = message_fit_in(form_message(system_prompt, user_prompt), chat_mdl.max_length)
     err = ""
     ans = ""
-    for _ in range(max_retry):
+    prompt_tokens = num_tokens_from_string(system_prompt + user_prompt)
+    # Get actual model instance
+    actual_mdl = getattr(chat_mdl, 'mdl', chat_mdl)
+    base_url = getattr(getattr(actual_mdl, 'async_client', None), '_base_url', 'unknown')
+    logging.info(f"[gen_json] Context: {context}, Model: {chat_mdl.llm_name}, Base URL: {base_url}, Prompt tokens: {prompt_tokens}, Max retry: {max_retry}")
+
+    for attempt in range(max_retry):
         if ans and err:
             msg[-1]["content"] += f"\nGenerated JSON is as following:\n{ans}\nBut exception while loading:\n{err}\nPlease reconsider and correct it."
-        ans = await chat_mdl.async_chat(msg[0]["content"], msg[1:], gen_conf=gen_conf)
-        ans = re.sub(r"(^.*</think>|```json\n|```\n*$)", "", ans, flags=re.DOTALL)
         try:
+            logging.info(f"[gen_json] Context '{context}' - Attempt {attempt + 1}/{max_retry} starting...")
+            response = await chat_mdl.async_chat(msg[0]["content"], msg[1:], gen_conf=gen_conf)
+            # Handle both (ans, tokens) tuple and single string return
+            if isinstance(response, tuple) and len(response) >= 1:
+                ans = response[0]
+                token_used = response[1] if len(response) > 1 else 0
+            else:
+                ans = response
+                token_used = 0
+            logging.info(f"[gen_json] Context '{context}' - Attempt {attempt + 1}/{max_retry} got response, len: {len(ans) if ans else 0}, tokens: {token_used}")
+
+            # Check for empty or error response
+            if not ans or ans.strip() == "":
+                logging.warning(f"[gen_json] Context '{context}' - Empty response from LLM")
+                err += "Empty response\n"
+                if attempt < max_retry - 1:
+                    await asyncio.sleep(2 ** attempt)
+                continue
+
+            # Check for error prefix from LLM
+            if ans.startswith("**ERROR**"):
+                logging.warning(f"[gen_json] Context '{context}' - LLM returned error: {ans}")
+                err += f"{ans}\n"
+                if attempt < max_retry - 1:
+                    await asyncio.sleep(2 ** attempt)
+                continue
+
+            ans = re.sub(r"(^.*</think>|```json\n|```\n*$)", "", ans, flags=re.DOTALL)
             res = json_repair.loads(ans)
+
+            # Validate result is not empty
+            if res is None or (isinstance(res, (list, dict)) and len(res) == 0):
+                logging.warning(f"[gen_json] Context '{context}' - Parsed result is empty: {res}")
+                err += f"Empty parsed result: {res}\n"
+                if attempt < max_retry - 1:
+                    await asyncio.sleep(2 ** attempt)
+                continue
+
             set_llm_cache(chat_mdl.llm_name, system_prompt, ans, user_prompt, gen_conf)
+            logging.info(f"[gen_json] Context '{context}' - Success after attempt {attempt + 1}, result type: {type(res)}")
             return res
         except Exception as e:
-            logging.exception(f"Loading json failure: {ans}")
-            err += str(e)
+            error_type = type(e).__name__
+            error_msg = str(e)
+            logging.exception(f"[gen_json] Context '{context}' - Attempt {attempt + 1}/{max_retry} FAILED: [{error_type}] {error_msg}")
+            err += f"[{error_type}] {error_msg}\n"
+            if attempt < max_retry - 1:
+                wait_time = 2 ** attempt  # exponential backoff
+                logging.info(f"[gen_json] Context '{context}' - Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+
+    logging.error(f"[gen_json] Context '{context}' - ALL {max_retry} ATTEMPTS FAILED. Model: {chat_mdl.llm_name}, Base URL: {base_url}")
+    logging.error(f"[gen_json] Context '{context}' - Accumulated errors: {err[:500]}")
+    return None
 
 
 TOC_DETECTION = load_prompt("toc_detection")
 
 
 async def detect_table_of_contents(page_1024: list[str], chat_mdl):
+    from graphrag.utils import chat_limiter
     toc_secs = []
     for i, sec in enumerate(page_1024[:22]):
-        ans = await gen_json(PROMPT_JINJA_ENV.from_string(TOC_DETECTION).render(page_txt=sec), "Only JSON please.",
-                             chat_mdl)
-        if toc_secs and not ans["exists"]:
+        try:
+            async with chat_limiter:
+                ans = await gen_json(PROMPT_JINJA_ENV.from_string(TOC_DETECTION).render(page_txt=sec), "Only JSON please.",
+                                     chat_mdl, context="detect_table_of_contents")
+            if ans and isinstance(ans, dict) and not ans.get("exists"):
+                break
+            toc_secs.append(sec)
+        except Exception as e:
+            logging.exception(f"[TOC] detect_table_of_contents failed at section {i}: {e}")
             break
-        toc_secs.append(sec)
     return toc_secs
 
 
@@ -526,11 +584,21 @@ TOC_EXTRACTION_CONTINUE = load_prompt("toc_extraction_continue")
 
 
 async def extract_table_of_contents(toc_pages, chat_mdl):
+    from graphrag.utils import chat_limiter
     if not toc_pages:
         return []
 
-    return await gen_json(PROMPT_JINJA_ENV.from_string(TOC_EXTRACTION).render(toc_page="\n".join(toc_pages)),
-                          "Only JSON please.", chat_mdl)
+    try:
+        async with chat_limiter:
+            result = await gen_json(PROMPT_JINJA_ENV.from_string(TOC_EXTRACTION).render(toc_page="\n".join(toc_pages)),
+                                  "Only JSON please.", chat_mdl, context="extract_table_of_contents")
+        if result is None:
+            logging.error("[TOC] extract_table_of_contents - LLM returned None")
+            return []
+        return result
+    except Exception as e:
+        logging.exception(f"[TOC] extract_table_of_contents failed: {e}")
+        return []
 
 
 async def toc_index_extractor(toc: list[dict], content: str, chat_mdl):
@@ -555,15 +623,26 @@ async def toc_index_extractor(toc: list[dict], content: str, chat_mdl):
     If the title of the section are not in the provided pages, do not add the physical_index to it.
     Directly return the final JSON structure. Do not output anything else."""
 
-    prompt = tob_extractor_prompt + '\nTable of contents:\n' + json.dumps(toc, ensure_ascii=False,
-                                                                          indent=2) + '\nDocument pages:\n' + content
-    return await gen_json(prompt, "Only JSON please.", chat_mdl)
+    from graphrag.utils import chat_limiter
+    try:
+        prompt = tob_extractor_prompt + '\nTable of contents:\n' + json.dumps(toc, ensure_ascii=False,
+                                                                              indent=2) + '\nDocument pages:\n' + content
+        async with chat_limiter:
+            result = await gen_json(prompt, "Only JSON please.", chat_mdl, context="toc_index_extractor")
+        if result is None:
+            logging.error("[TOC] toc_index_extractor - LLM returned None")
+            return []
+        return result
+    except Exception as e:
+        logging.exception(f"[TOC] toc_index_extractor failed: {e}")
+        return []
 
 
 TOC_INDEX = load_prompt("toc_index")
 
 
 async def table_of_contents_index(toc_arr: list[dict], sections: list[str], chat_mdl):
+    from graphrag.utils import chat_limiter
     if not toc_arr or not sections:
         return []
 
@@ -636,13 +715,18 @@ async def table_of_contents_index(toc_arr: list[dict], sections: list[str], chat
             e = toc_arr[e]["indices"][0]
 
         for j in range(st_i, min(e + 1, len(sections))):
-            ans = await gen_json(PROMPT_JINJA_ENV.from_string(TOC_INDEX).render(
-                structure=it["structure"],
-                title=it["title"],
-                text=sections[j]), "Only JSON please.", chat_mdl)
-            if ans["exist"] == "yes":
-                it["indices"].append(j)
-                break
+            try:
+                async with chat_limiter:
+                    ans = await gen_json(PROMPT_JINJA_ENV.from_string(TOC_INDEX).render(
+                        structure=it["structure"],
+                        title=it["title"],
+                        text=sections[j]), "Only JSON please.", chat_mdl, context="table_of_contents_index")
+                if ans and isinstance(ans, dict) and ans.get("exist") == "yes":
+                    it["indices"].append(j)
+                    break
+            except Exception as e:
+                logging.exception(f"[TOC] table_of_contents_index failed at i={i}, j={j}: {e}")
+                continue
 
         i += 1
 
@@ -650,6 +734,7 @@ async def table_of_contents_index(toc_arr: list[dict], sections: list[str], chat
 
 
 async def check_if_toc_transformation_is_complete(content, toc, chat_mdl):
+    from graphrag.utils import chat_limiter
     prompt = """
     You are given a raw table of contents and a  table of contents.
     Your job is to check if the  table of contents is complete.
@@ -661,12 +746,20 @@ async def check_if_toc_transformation_is_complete(content, toc, chat_mdl):
     }}
     Directly return the final JSON structure. Do not output anything else."""
 
-    prompt = prompt + '\n Raw Table of contents:\n' + content + '\n Cleaned Table of contents:\n' + toc
-    response = await gen_json(prompt, "Only JSON please.", chat_mdl)
-    return response['completed']
+    try:
+        prompt = prompt + '\n Raw Table of contents:\n' + content + '\n Cleaned Table of contents:\n' + toc
+        async with chat_limiter:
+            response = await gen_json(prompt, "Only JSON please.", chat_mdl, context="check_if_toc_transformation_is_complete")
+        if response and isinstance(response, dict):
+            return response.get('completed', 'no')
+        return 'no'
+    except Exception as e:
+        logging.exception(f"[TOC] check_if_toc_transformation_is_complete failed: {e}")
+        return 'no'
 
 
 async def toc_transformer(toc_pages, chat_mdl):
+    from graphrag.utils import chat_limiter
     init_prompt = """
     You are given a table of contents, You job is to transform the whole table of content into a JSON format included table_of_contents.
 
@@ -684,57 +777,101 @@ async def toc_transformer(toc_pages, chat_mdl):
     You should transform the full table of contents in one go.
     Directly return the final JSON structure, do not output anything else. """
 
-    toc_content = "\n".join(toc_pages)
-    prompt = init_prompt + '\n Given table of contents\n:' + toc_content
+    try:
+        toc_content = "\n".join(toc_pages)
+        prompt = init_prompt + '\n Given table of contents\n:' + toc_content
 
-    def clean_toc(arr):
-        for a in arr:
-            a["title"] = re.sub(r"[.·….]{2,}", "", a["title"])
+        def clean_toc(arr):
+            for a in arr:
+                a["title"] = re.sub(r"[.·….]{2,}", "", a["title"])
 
-    last_complete = await gen_json(prompt, "Only JSON please.", chat_mdl)
-    if_complete = await check_if_toc_transformation_is_complete(toc_content,
-                                                                json.dumps(last_complete, ensure_ascii=False, indent=2),
-                                                                chat_mdl)
-    clean_toc(last_complete)
-    if if_complete == "yes":
-        return last_complete
+        async with chat_limiter:
+            last_complete = await gen_json(prompt, "Only JSON please.", chat_mdl, context="toc_transformer")
+        if last_complete is None:
+            logging.error("[TOC] toc_transformer - Initial LLM call returned None")
+            return []
 
-    while not (if_complete == "yes"):
-        prompt = f"""
-        Your task is to continue the table of contents json structure, directly output the remaining part of the json structure.
-        The response should be in the following JSON format:
-
-        The raw table of contents json structure is:
-        {toc_content}
-
-        The incomplete transformed table of contents json structure is:
-        {json.dumps(last_complete[-24:], ensure_ascii=False, indent=2)}
-
-        Please continue the json structure, directly output the remaining part of the json structure."""
-        new_complete = await gen_json(prompt, "Only JSON please.", chat_mdl)
-        if not new_complete or str(last_complete).find(str(new_complete)) >= 0:
-            break
-        clean_toc(new_complete)
-        last_complete.extend(new_complete)
         if_complete = await check_if_toc_transformation_is_complete(toc_content,
-                                                                    json.dumps(last_complete, ensure_ascii=False,
-                                                                               indent=2), chat_mdl)
+                                                                    json.dumps(last_complete, ensure_ascii=False, indent=2),
+                                                                    chat_mdl)
+        clean_toc(last_complete)
+        if if_complete == "yes":
+            return last_complete
 
-    return last_complete
+        max_iterations = 5
+        iteration = 0
+        while not (if_complete == "yes") and iteration < max_iterations:
+            iteration += 1
+            prompt = f"""
+            Your task is to continue the table of contents json structure, directly output the remaining part of the json structure.
+            The response should be in the following JSON format:
+
+            The raw table of contents json structure is:
+            {toc_content}
+
+            The incomplete transformed table of contents json structure is:
+            {json.dumps(last_complete[-24:], ensure_ascii=False, indent=2)}
+
+            Please continue the json structure, directly output the remaining part of the json structure."""
+            async with chat_limiter:
+                new_complete = await gen_json(prompt, "Only JSON please.", chat_mdl, context="toc_transformer_continue")
+            if not new_complete or str(last_complete).find(str(new_complete)) >= 0:
+                break
+            clean_toc(new_complete)
+            last_complete.extend(new_complete)
+            if_complete = await check_if_toc_transformation_is_complete(toc_content,
+                                                                        json.dumps(last_complete, ensure_ascii=False,
+                                                                                   indent=2), chat_mdl)
+
+        return last_complete
+    except Exception as e:
+        logging.exception(f"[TOC] toc_transformer failed: {e}")
+        return []
 
 
 TOC_LEVELS = load_prompt("assign_toc_levels")
 
 
 async def assign_toc_levels(toc_secs, chat_mdl, gen_conf={"temperature": 0.2}):
+    from graphrag.utils import chat_limiter
     if not toc_secs:
         return []
-    return await gen_json(
-        PROMPT_JINJA_ENV.from_string(TOC_LEVELS).render(),
-        str(toc_secs),
-        chat_mdl,
-        gen_conf
-    )
+    # Get actual model instance
+    actual_mdl = getattr(chat_mdl, 'mdl', chat_mdl)
+    base_url = getattr(getattr(actual_mdl, 'async_client', None), '_base_url', 'unknown')
+    logging.info(f"[TOC] assign_toc_levels - TOC sections: {len(toc_secs)}, "
+                 f"Model: {chat_mdl.llm_name}, Base URL: {base_url}")
+    try:
+        async with chat_limiter:
+            result = await gen_json(
+                PROMPT_JINJA_ENV.from_string(TOC_LEVELS).render(),
+                str(toc_secs),
+                chat_mdl,
+                gen_conf,
+                context="assign_toc_levels"
+            )
+        logging.info(f"[TOC] assign_toc_levels - gen_json returned type: {type(result)}, value: {result}")
+        if result and isinstance(result, list) and len(result) > 0:
+            return result
+        # If LLM returns empty/invalid, use fallback heuristic
+        logging.warning(f"[TOC] assign_toc_levels - LLM returned empty/invalid, using fallback heuristic")
+    except Exception as e:
+        logging.exception(f"[TOC] assign_toc_levels failed: {e}")
+
+    # Fallback: simple heuristic - first item is level 1, use keywords to detect level changes
+    fallback_result = []
+    current_level = "1"
+    for i, title in enumerate(toc_secs):
+        if i == 0:
+            current_level = "1"
+        # Detect potential chapter/section keywords
+        elif any(kw in title.lower() for kw in ['chapter', 'part', '附录', 'chapter', '部分']):
+            current_level = "1"
+        elif any(kw in title.lower() for kw in ['section', '节', '章', '篇']):
+            current_level = "2"
+        fallback_result.append({"level": current_level, "title": title})
+    #logging.info(f"[TOC] assign_toc_levels - Fallback result: {fallback_result}")
+    return fallback_result
 
 
 TOC_FROM_TEXT_SYSTEM = load_prompt("toc_from_text_system")
@@ -743,19 +880,32 @@ TOC_FROM_TEXT_USER = load_prompt("toc_from_text_user")
 
 # Generate TOC from text chunks with text llms
 async def gen_toc_from_text(txt_info: dict, chat_mdl, callback=None):
+    from graphrag.utils import chat_limiter
     if callback:
         callback(msg="")
     try:
-        ans = await gen_json(
-            PROMPT_JINJA_ENV.from_string(TOC_FROM_TEXT_SYSTEM).render(),
-            PROMPT_JINJA_ENV.from_string(TOC_FROM_TEXT_USER).render(
-                text="\n".join([json.dumps(d, ensure_ascii=False) for d in txt_info["chunks"]])),
-            chat_mdl,
-            gen_conf={"temperature": 0.0, "top_p": 0.9}
-        )
-        txt_info["toc"] = ans if ans and not isinstance(ans, str) else []
+        # Get actual model instance
+        actual_mdl = getattr(chat_mdl, 'mdl', chat_mdl)
+        base_url = getattr(getattr(actual_mdl, 'async_client', None), '_base_url', 'unknown')
+        #logging.info(f"[TOC] gen_toc_from_text - Model: {chat_mdl.llm_name}, Base URL: {base_url}")
+        #logging.info(f"[TOC] gen_toc_from_text - Chunks count: {len(txt_info.get('chunks', []))}")
+        async with chat_limiter:
+            ans = await gen_json(
+                PROMPT_JINJA_ENV.from_string(TOC_FROM_TEXT_SYSTEM).render(),
+                PROMPT_JINJA_ENV.from_string(TOC_FROM_TEXT_USER).render(
+                    text="\n".join([json.dumps(d, ensure_ascii=False) for d in txt_info["chunks"]])),
+                chat_mdl,
+                gen_conf={"temperature": 0.0, "top_p": 0.9},
+                context="gen_toc_from_text"
+            )
+        if ans is None:
+            logging.error(f"[TOC] gen_toc_from_text - LLM returned None, Base URL: {base_url}")
+            txt_info["toc"] = []
+        else:
+            txt_info["toc"] = ans if ans and not isinstance(ans, str) else []
     except Exception as e:
-        logging.exception(e)
+        logging.exception(f"[TOC] gen_toc_from_text failed: {e}")
+        txt_info["toc"] = []
 
 
 def split_chunks(chunks, max_length: int):
@@ -780,6 +930,7 @@ def split_chunks(chunks, max_length: int):
 
 
 async def run_toc_from_text(chunks, chat_mdl, callback=None):
+    #from graphrag.utils import chat_limiter
     input_budget = int(chat_mdl.max_length * INPUT_UTILIZATION) - num_tokens_from_string(
         TOC_FROM_TEXT_USER + TOC_FROM_TEXT_SYSTEM
     )
@@ -788,17 +939,24 @@ async def run_toc_from_text(chunks, chat_mdl, callback=None):
     chunk_sections = split_chunks(chunks, input_budget)
     titles = []
 
+    # Get actual model instance
+    #actual_mdl = getattr(chat_mdl, 'mdl', chat_mdl)
+    #base_url = getattr(getattr(actual_mdl, 'async_client', None), '_base_url', 'unknown')
+    #logging.info(f"[TOC] run_toc_from_text - Total chunks: {len(chunks)}, Split into: {len(chunk_sections)} sections, "f"Model: {chat_mdl.llm_name}, Base URL: {base_url}")
+
     chunks_res = []
     tasks = []
     for i, chunk in enumerate(chunk_sections):
         if not chunk:
             continue
         chunks_res.append({"chunks": chunk})
+        #logging.info(f"[TOC] Creating task {i+1}/{len(chunk_sections)} with {len(chunk)} chunks")
         tasks.append(asyncio.create_task(gen_toc_from_text(chunks_res[-1], chat_mdl, callback)))
     try:
         await asyncio.gather(*tasks, return_exceptions=False)
+        logging.info(f"[TOC] All {len(tasks)} tasks completed successfully")
     except Exception as e:
-        logging.error(f"Error generating TOC: {e}")
+        logging.error(f"[TOC] Error generating TOC: {e}")
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -820,26 +978,39 @@ async def run_toc_from_text(chunks, chat_mdl, callback=None):
             continue
         filtered.append(x)
 
-    logging.info(f"\n\nFiltered TOC sections:\n{filtered}")
+    #logging.info(f"\n\nFiltered TOC sections:\n{filtered}")
     if not filtered:
         return []
 
     # Generate initial level (level/title)
     raw_structure = [x.get("title", "") for x in filtered]
+    #logging.info(f"[TOC] run_toc_from_text - Raw structure for level assignment: {raw_structure}")
 
     # Assign hierarchy levels using LLM
     toc_with_levels = await assign_toc_levels(raw_structure, chat_mdl, {"temperature": 0.0, "top_p": 0.9})
+    #logging.info(f"[TOC] run_toc_from_text - assign_toc_levels returned: {toc_with_levels}")
     if not toc_with_levels:
+        logging.error("[TOC] run_toc_from_text - assign_toc_levels returned empty, returning []")
         return []
 
     # Merge structure and content (by index)
+    logging.info(f"[TOC] run_toc_from_text - Merging: toc_with_levels({len(toc_with_levels)}) with filtered({len(filtered)})")
+    if len(toc_with_levels) != len(filtered):
+        logging.error(f"[TOC] run_toc_from_text - MISMATCH: toc_with_levels has {len(toc_with_levels)} items, filtered has {len(filtered)} items")
+        # Try to match by title
+        toc_map = {item.get('title', ''): item for item in toc_with_levels if isinstance(item, dict)}
+        toc_with_levels = [toc_map.get(src.get('title', ''), {'level': '1', 'title': src.get('title', '')}) for src in filtered]
+
     prune = len(toc_with_levels) > 512
     max_lvl = "0"
     sorted_list = sorted([t.get("level", "0") for t in toc_with_levels if isinstance(t, dict)])
     if sorted_list:
         max_lvl = sorted_list[-1]
     merged = []
-    for _, (toc_item, src_item) in enumerate(zip(toc_with_levels, filtered)):
+    for i, (toc_item, src_item) in enumerate(zip(toc_with_levels, filtered)):
+        if not isinstance(toc_item, dict):
+            logging.warning(f"[TOC] run_toc_from_text - Item {i} is not a dict: {toc_item}")
+            continue
         if prune and toc_item.get("level", "0") >= max_lvl:
             continue
         merged.append({
@@ -848,21 +1019,52 @@ async def run_toc_from_text(chunks, chat_mdl, callback=None):
             "chunk_id": src_item.get("chunk_id", ""),
         })
 
+    logging.info(f"[TOC] run_toc_from_text - Merged result: {len(merged)} items")
     return merged
 
 
 TOC_RELEVANCE_SYSTEM = load_prompt("toc_relevance_system")
 TOC_RELEVANCE_USER = load_prompt("toc_relevance_user")
 async def relevant_chunks_with_toc(query: str, toc: list[dict], chat_mdl, topn: int = 6):
+    from graphrag.utils import chat_limiter
     import numpy as np
+    
+    if not toc:
+        return []
+    
+    # Limit TOC size to avoid large request body and timeout
+    # Model server takes ~100s to process large TOC, causing connection drops
+    MAX_TOC_ITEMS = 30  # Reduced to ensure processing completes within connection timeout
+    MAX_TOC_LEVEL = 2   # Only keep top-level sections (level 1-2) for faster processing
+    original_count = len(toc)
+    
+    # Filter: keep only level 1-2 entries, they are most relevant for retrieval
+    toc = [t for t in toc if int(t.get("level", 1)) <= MAX_TOC_LEVEL]
+    level_filtered_count = len(toc)
+    
+    if len(toc) > MAX_TOC_ITEMS:
+        logging.warning(f"[TOC] relevant_chunks_with_toc - TOC too large ({original_count}, level 1-2: {level_filtered_count}), truncating to {MAX_TOC_ITEMS}")
+        toc = toc[:MAX_TOC_ITEMS]
+    else:
+        logging.info(f"[TOC] relevant_chunks_with_toc - Filtered to level 1-2: {level_filtered_count}/{original_count} entries")
+    
+    # Estimate prompt size
+    toc_json_str = "[\n%s\n]" % "\n".join(
+        [json.dumps({"level": d["level"], "title": d["title"]}, ensure_ascii=False) for d in toc]
+    )
+    prompt_size = len(toc_json_str) + len(query)
+    logging.info(f"[TOC] relevant_chunks_with_toc - Query: '{query[:50]}...', TOC items: {len(toc)}/{original_count}, "
+                 f"Prompt size: {prompt_size} chars, Model: {chat_mdl.llm_name if chat_mdl else 'None'}")
+    
     try:
-        ans = await gen_json(
-            PROMPT_JINJA_ENV.from_string(TOC_RELEVANCE_SYSTEM).render(),
-            PROMPT_JINJA_ENV.from_string(TOC_RELEVANCE_USER).render(query=query, toc_json="[\n%s\n]\n" % "\n".join(
-                [json.dumps({"level": d["level"], "title": d["title"]}, ensure_ascii=False) for d in toc])),
-            chat_mdl,
-            gen_conf={"temperature": 0.0, "top_p": 0.9}
-        )
+        async with chat_limiter:
+            ans = await gen_json(
+                PROMPT_JINJA_ENV.from_string(TOC_RELEVANCE_SYSTEM).render(),
+                PROMPT_JINJA_ENV.from_string(TOC_RELEVANCE_USER).render(query=query, toc_json=toc_json_str + "\n"),
+                chat_mdl,
+                gen_conf={"temperature": 0.0, "top_p": 0.9},
+                context="relevant_chunks_with_toc"
+            )
         id2score = {}
         for ti, sc in zip(toc, ans):
             if not isinstance(sc, dict) or sc.get("score", -1) < 1:

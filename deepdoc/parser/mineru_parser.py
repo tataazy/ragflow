@@ -42,8 +42,7 @@ LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
 if LOCK_KEY_pdfplumber not in sys.modules:
     sys.modules[LOCK_KEY_pdfplumber] = threading.Lock()
 
-# todo 从配置中读取
-image_pre_url = "http://172.24.72.178/v1/document/image/"
+
 
 class MinerUContentType(StrEnum):
     IMAGE = "image"
@@ -160,9 +159,10 @@ class MinerUParseOptions:
 
 
 class MinerUParser(RAGFlowPdfParser):
-    def __init__(self, mineru_path: str = "mineru", mineru_api: str = "", mineru_server_url: str = ""):
+    def __init__(self, mineru_path: str = "mineru", mineru_api: str = "", mineru_server_url: str = "", mineru_image_pre_url: str = ""):
         self.mineru_api = mineru_api.rstrip("/")
         self.mineru_server_url = mineru_server_url.rstrip("/")
+        self.mineru_image_pre_url = mineru_image_pre_url
         self.outlines = []
         self.logger = logging.getLogger(self.__class__.__name__)
         self.b64_data_uri_pattern = re.compile(r'^data:image/(\w+);base64,(.+)$')
@@ -789,7 +789,7 @@ class MinerUParser(RAGFlowPdfParser):
 
             if img_path in image_mapping:
                 minio_id = image_mapping[img_path]
-                new_ref = f"![{alt_text}]({image_pre_url}{minio_id})"
+                new_ref = f"![{alt_text}]({self.mineru_image_pre_url}{minio_id})"
                 replaced_count += 1
                 logger.debug(f"[MinerU]   替换: {img_path} -> minio://{minio_id}")
                 # 检查图片前是否有足够的换行（确保表格后图片能正确渲染）

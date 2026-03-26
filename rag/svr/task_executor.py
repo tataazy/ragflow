@@ -670,14 +670,27 @@ async def build_chunks(task, progress_callback):
 
 def build_TOC(task, docs, progress_callback):
     progress_callback(msg="Start to generate table of content ...")
-    chat_mdl = LLMBundle(task["tenant_id"], LLMType.CHAT, llm_name=task["llm_id"], lang=task["language"])
-    docs = sorted(docs, key=lambda d: (
-        d.get("page_num_int", 0)[0] if isinstance(d.get("page_num_int", 0), list) else d.get("page_num_int", 0),
-        d.get("top_int", 0)[0] if isinstance(d.get("top_int", 0), list) else d.get("top_int", 0)
-    ))
-    toc: list[dict] = asyncio.run(
-        run_toc_from_text([d["content_with_weight"] for d in docs], chat_mdl, progress_callback))
-    logging.info("------------ T O C -------------\n" + json.dumps(toc, ensure_ascii=False, indent='  '))
+    logging.info(f"[TOC] build_TOC started - Task ID: {task.get('id', 'unknown')}, "
+                 f"LLM ID: {task.get('llm_id', 'unknown')}, Docs count: {len(docs)}")
+    try:
+        chat_mdl = LLMBundle(task["tenant_id"], LLMType.CHAT, llm_name=task["llm_id"], lang=task["language"])
+        # Get actual model instance
+        actual_mdl = getattr(chat_mdl, 'mdl', chat_mdl)
+        base_url = getattr(getattr(actual_mdl, 'async_client', None), '_base_url', 'unknown')
+        logging.info(f"[TOC] LLM Bundle created - Model: {chat_mdl.llm_name}, "
+                     f"Base URL: {base_url}, Max Length: {chat_mdl.max_length}")
+        docs = sorted(docs, key=lambda d: (
+            d.get("page_num_int", 0)[0] if isinstance(d.get("page_num_int", 0), list) else d.get("page_num_int", 0),
+            d.get("top_int", 0)[0] if isinstance(d.get("top_int", 0), list) else d.get("top_int", 0)
+        ))
+        toc: list[dict] = asyncio.run(
+            run_toc_from_text([d["content_with_weight"] for d in docs], chat_mdl, progress_callback))
+        logging.info(f"[TOC] build_TOC completed - TOC entries: {len(toc) if toc else 0}")
+    except Exception as e:
+        logging.exception(f"[TOC] build_TOC failed for task {task.get('id', 'unknown')}: {e}")
+        progress_callback(msg=f"TOC generation failed: {str(e)[:100]}")
+        return None
+    #logging.info("------------ T O C -------------\n" + json.dumps(toc, ensure_ascii=False, indent='  '))
     for ii, item in enumerate(toc):
         try:
             chunk_val = item.pop("chunk_id", None)
@@ -1281,6 +1294,7 @@ async def do_handle_task(task):
         progress_message = "Embedding chunks ({:.2f}s)".format(timer() - start_ts)
         logging.info(progress_message)
         progress_callback(msg=progress_message)
+        #logging.info(f"do_handle_task task parser_id:{task['parser_id']}, parser_config:{task['parser_config']}")
         if task["parser_id"].lower() == "naive" and task["parser_config"].get("toc_extraction", False):
             toc_thread = executor.submit(build_TOC, task, chunks, progress_callback)
 

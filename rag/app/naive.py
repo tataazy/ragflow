@@ -754,20 +754,8 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
     parser_config = kwargs.get("parser_config", {"chunk_token_num": 512, "delimiter": "\n!?。；！？", "layout_recognize": "DeepDOC", "analyze_hyperlink": True})
 
     #logging.info(f"parser_config: {parser_config}")
-
-    # 智能分割配置
-    use_smart_chunking = parser_config.get("use_smart_chunking", True)
-    if use_smart_chunking:
-        smart_config = {
-            "chunk_size": max(1024, int(parser_config.get("chunk_token_num", 512)) * 3),  # 更合理的转换比例
-            "chunk_overlap": int(parser_config.get("chunk_token_num", 512)) * int(parser_config.get("overlapped_percent", 0)) // 100,
-            "separators": ["\n\n", "\n", "。", "！", "？", ".", "!", "?"],
-            "preserve_elements": ["table", "image", "code_block", "math_block"],
-            "strategy": "structure_aware"
-        }
-        smart_chunker = create_smart_chunker(smart_config)
-    else:
-        smart_chunker = None
+    use_smart_chunking = False
+    smart_chunker = None
 
     child_deli = (parser_config.get("children_delimiter") or "").encode("utf-8").decode("unicode_escape").encode("latin1").decode("utf-8")
     cust_child_deli = re.findall(r"`([^`]+)`", child_deli)
@@ -860,6 +848,17 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
 
         # 对于MinerU等已经结构化的内容，禁用子分隔符避免过度分割
         if name == "mineru":  # 只对MinerU生效
+            # 智能分割配置
+            use_smart_chunking = True
+            smart_config = {
+                "chunk_size": max(1024, int(parser_config.get("chunk_token_num", 512)) * 3),  # 更合理的转换比例
+                "chunk_overlap": int(parser_config.get("chunk_token_num", 512)) * int(parser_config.get("overlapped_percent", 0)) // 100,
+                "separators": ["\n\n", "\n", "。", "！", "？", ".", "!", "?"],
+                "preserve_elements": ["table", "image", "code_block", "math_block"],
+                "strategy": "structure_aware"
+            }
+            logging.info(f"mineru parser_config: {smart_config}")
+            smart_chunker = create_smart_chunker(smart_config)
             child_deli = ""  # 清空子分隔符，让智能分割器处理
 
         # 调用解析器并处理不同返回值格式的兼容性
@@ -1147,48 +1146,48 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
             # non_none_count = len([img for img in section_images if img is not None])
             # logging.info(f"[DEBUG] 非None图片数量: {non_none_count}")
             
-            if use_smart_chunking and smart_chunker:
-                logging.info(f"[DEBUG] 使用智能分割处理带图片内容")
-                # 使用智能分割处理带图片的内容
-                text_sections = [sec[0] if isinstance(sec, tuple) else sec for sec in sections]
-                logging.info(f"[DEBUG] 提取的文本sections数量: {len(text_sections)}")
-                logging.info(f"[DEBUG] 前3个文本sections预览: {text_sections[:3]}")
-                
-                chunks, images = smart_merge_with_images(
-                    text_sections,
-                    section_images,
-                    int(parser_config.get("chunk_token_num", 128)),
-                    parser_config.get("delimiter", "\n!?。；！？"),
-                    overlapped_percent
-                )
-                logging.info(f"[DEBUG] 智能分割结果 - chunks: {len(chunks)}, images: {len(images)}")
-                if images:
-                    images_non_none = len([img for img in images if img is not None])
-                    logging.info(f"[DEBUG] 分割后非None图片数量: {images_non_none}")
-            else:
-                logging.info(f"[DEBUG] 使用原有逻辑处理带图片内容")
-                # 原有逻辑
-                chunks, images = naive_merge_with_images(sections, section_images, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
-                logging.info(f"[DEBUG] 原有逻辑结果 - chunks: {len(chunks)}, images: {len(images)}")
+            # if use_smart_chunking and smart_chunker:
+            #     logging.info(f"[DEBUG] 使用智能分割处理带图片内容")
+            #     # 使用智能分割处理带图片的内容
+            #     text_sections = [sec[0] if isinstance(sec, tuple) else sec for sec in sections]
+            #     logging.info(f"[DEBUG] 提取的文本sections数量: {len(text_sections)}")
+            #     logging.info(f"[DEBUG] 前3个文本sections预览: {text_sections[:3]}")
+            #
+            #     chunks, images = smart_merge_with_images(
+            #         text_sections,
+            #         section_images,
+            #         int(parser_config.get("chunk_token_num", 128)),
+            #         parser_config.get("delimiter", "\n!?。；！？"),
+            #         overlapped_percent
+            #     )
+            #     logging.info(f"[DEBUG] 智能分割结果 - chunks: {len(chunks)}, images: {len(images)}")
+            #     if images:
+            #         images_non_none = len([img for img in images if img is not None])
+            #         logging.info(f"[DEBUG] 分割后非None图片数量: {images_non_none}")
+            #else:
+            logging.info(f"[DEBUG] 使用原有逻辑处理带图片内容")
+            # 原有逻辑
+            chunks, images = naive_merge_with_images(sections, section_images, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
+            logging.info(f"[DEBUG] 原有逻辑结果 - chunks: {len(chunks)}, images: {len(images)}")
             
             res.extend(tokenize_chunks_with_images(chunks, doc, is_english, images, child_delimiters_pattern=child_deli))
         else:
-            logging.info(f"[DEBUG] section_images为空，使用纯文本处理")
-            if use_smart_chunking and smart_chunker:
-                logging.info(f"[DEBUG] 使用智能分割处理纯文本")
-                # 使用智能分割处理纯文本
-                chunks = smart_merge(
-                    sections,
-                    int(parser_config.get("chunk_token_num", 128)),
-                    parser_config.get("delimiter", "\n!?。；！？"),
-                    overlapped_percent
-                )
-                logging.info(f"[DEBUG] 智能分割纯文本结果 - chunks: {len(chunks)}")
-            else:
-                logging.info(f"[DEBUG] 使用原有逻辑处理纯文本")
-                # 原有逻辑
-                chunks = naive_merge(sections, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
-                logging.info(f"[DEBUG] 原有逻辑纯文本结果 - chunks: {len(chunks)}")
+            #logging.info(f"[DEBUG] section_images为空，使用纯文本处理")
+            # if use_smart_chunking and smart_chunker:
+            #     logging.info(f"[DEBUG] 使用智能分割处理纯文本")
+            #     # 使用智能分割处理纯文本
+            #     chunks = smart_merge(
+            #         sections,
+            #         int(parser_config.get("chunk_token_num", 128)),
+            #         parser_config.get("delimiter", "\n!?。；！？"),
+            #         overlapped_percent
+            #     )
+            #     logging.info(f"[DEBUG] 智能分割纯文本结果 - chunks: {len(chunks)}")
+            # else:
+            #logging.info(f"[DEBUG] 使用原有逻辑处理纯文本")
+            # 原有逻辑
+            chunks = naive_merge(sections, int(parser_config.get("chunk_token_num", 128)), parser_config.get("delimiter", "\n!?。；！？"), overlapped_percent)
+            logging.info(f"[DEBUG] 原有逻辑纯文本结果 - chunks: {len(chunks)}")
 
             res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser, child_delimiters_pattern=child_deli))
 
