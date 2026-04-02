@@ -59,12 +59,12 @@ class RAGFlowAzureSpnBlob:
         f.append_data(binary, offset=0, length=len(binary))
         return f.flush_data(len(binary))
 
-    def put(self, bucket, fnm, binary):
+    def put(self, bucket, fnm, binary, content_type=None):
         for _ in range(3):
             try:
                 f = self.conn.create_file(fnm)
                 f.append_data(binary, offset=0, length=len(binary))
-                return f.flush_data(len(binary))
+                return f.flush_data(len(binary), content_settings={"content_type": content_type} if content_type else None)
             except Exception:
                 logging.exception(f"Fail put {bucket}/{fnm}")
                 self.__open__()

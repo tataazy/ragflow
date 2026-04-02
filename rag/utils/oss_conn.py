@@ -131,14 +131,18 @@ class RAGFlowOSS:
 
     @use_prefix_path
     @use_default_bucket
-    def put(self, bucket, fnm, binary, tenant_id=None):
+    def put(self, bucket, fnm, binary, tenant_id=None, content_type=None):
         logging.debug(f"bucket name {bucket}; filename :{fnm}:")
         for _ in range(1):
             try:
                 if not self.bucket_exists(bucket):
                     self.conn.create_bucket(Bucket=bucket)
                     logging.info(f"create bucket {bucket} ********")
-                r = self.conn.upload_fileobj(BytesIO(binary), bucket, fnm)
+                extra_args = {}
+                #extra_args['bucketType'] = 'public'
+                if content_type:
+                    extra_args['ContentType'] = content_type
+                r = self.conn.upload_fileobj(BytesIO(binary), bucket, fnm, ExtraArgs=extra_args)
 
                 return r
             except Exception:

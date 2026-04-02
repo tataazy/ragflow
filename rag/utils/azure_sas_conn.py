@@ -20,6 +20,7 @@ import time
 from io import BytesIO
 from common.decorator import singleton
 from azure.storage.blob import ContainerClient
+from azure.storage.blob import ContentSettings
 from common import settings
 
 
@@ -51,10 +52,11 @@ class RAGFlowAzureSasBlob:
         _bucket, fnm, binary = "txtxtxtxt1", "txtxtxtxt1", b"_t@@@1"
         return self.conn.upload_blob(name=fnm, data=BytesIO(binary), length=len(binary))
 
-    def put(self, bucket, fnm, binary):
+    def put(self, bucket, fnm, binary, content_type=None):
         for _ in range(3):
             try:
-                return self.conn.upload_blob(name=fnm, data=BytesIO(binary), length=len(binary))
+                return self.conn.upload_blob(name=fnm, data=BytesIO(binary), length=len(binary),
+                                             content_settings=ContentSettings(content_type=content_type) if content_type else None)
             except Exception:
                 logging.exception(f"Fail put {bucket}/{fnm}")
                 self.__open__()

@@ -65,7 +65,7 @@ class RAGFlowGCS:
             logging.exception(f"Health check failed: {e}")
             return False
 
-    def put(self, bucket, fnm, binary, tenant_id=None):
+    def put(self, bucket, fnm, binary, tenant_id=None, content_type=None):
         # RENAMED PARAMETER: bucket_name -> bucket (to match interface)
         for _ in range(3):
             try:
@@ -73,7 +73,7 @@ class RAGFlowGCS:
                 blob_path = self._get_blob_path(bucket, fnm)
                 blob = bucket_obj.blob(blob_path)
 
-                blob.upload_from_file(BytesIO(binary), content_type='application/octet-stream')
+                blob.upload_from_file(BytesIO(binary), content_type=content_type or 'application/octet-stream')
                 return True
             except NotFound:
                 logging.error(f"Fail to put: Main bucket {self.bucket_name} does not exist.")

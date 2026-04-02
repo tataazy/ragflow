@@ -122,7 +122,7 @@ class RAGFlowMinio:
 
     @use_default_bucket
     @use_prefix_path
-    def put(self, bucket, fnm, binary, tenant_id=None):
+    def put(self, bucket, fnm, binary, tenant_id=None, content_type=None):
         for _ in range(3):
             try:
                 # Note: bucket must already exist - we don't have permission to create buckets
@@ -131,7 +131,8 @@ class RAGFlowMinio:
 
                 r = self.conn.put_object(bucket, fnm,
                                          BytesIO(binary),
-                                         len(binary)
+                                         len(binary),
+                                         content_type=content_type
                                          )
                 return r
             except Exception:

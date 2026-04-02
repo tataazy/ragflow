@@ -46,7 +46,7 @@ class EncryptedStorageWrapper:
 
         logging.info(f"EncryptedStorageWrapper initialized with algorithm: {algorithm}")
 
-    def put(self, bucket, fnm, binary, tenant_id=None):
+    def put(self, bucket, fnm, binary, tenant_id=None, content_type=None):
         """
         Encrypt and store data
         
@@ -55,17 +55,18 @@ class EncryptedStorageWrapper:
             fnm: File name
             binary: Original binary data
             tenant_id: Tenant ID (optional)
+            content_type: Content MIME type (optional)
             
         Returns:
             Storage result
         """
         if not self.encryption_enabled:
-            return self.storage_impl.put(bucket, fnm, binary, tenant_id)
+            return self.storage_impl.put(bucket, fnm, binary, tenant_id, content_type=content_type)
 
         try:
             encrypted_binary = self.crypto.encrypt(binary)
 
-            return self.storage_impl.put(bucket, fnm, encrypted_binary, tenant_id)
+            return self.storage_impl.put(bucket, fnm, encrypted_binary, tenant_id, content_type=content_type)
         except Exception as e:
             logging.exception(f"Failed to encrypt and store data: {bucket}/{fnm}, error: {str(e)}")
             raise

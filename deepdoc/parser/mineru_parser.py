@@ -43,6 +43,198 @@ if LOCK_KEY_pdfplumber not in sys.modules:
     sys.modules[LOCK_KEY_pdfplumber] = threading.Lock()
 
 
+class MinerUOSSUploader:
+    """
+    MinerU专用OSS上传类
+    独立于系统STORAGE_IMPL，直接操作OSS
+    """
+    
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self):
+        if MinerUOSSUploader._initialized:
+            return
+        
+        self.conn = None
+        self.bucket = None
+        self.endpoint_url = None
+        self.prefix_path = None
+        self._init_from_env()
+        MinerUOSSUploader._initialized = True
+    
+    def _init_from_env(self):
+        """从环境变量初始化OSS配置"""
+        # 支持两种配置方式:
+        # 1. 直接OSS配置 (MINERU_OSS_*)
+        # 2. 从系统OSS配置读取 (OSS_*)
+        
+        self.access_key = '1p9btruvxtj74rjuusjo'
+        self.secret_key = 'ihpyf57w7bkpute876y9vcjz25enh9q7hr5xl0is'
+        self.endpoint_url = 'http://s3bucket.fehorizon.com'
+        self.region = 'cn-north-1'
+        self.bucket = 'public'
+        self.prefix_path = os.getenv('OSS_PREFIX_PATH', '')
+        
+        # 如果没有直接配置，尝试从service_conf.yaml读取
+        # if not all([self.access_key, self.secret_key, self.endpoint_url]):
+        #     try:
+        #         self._load_from_service_conf()
+        #     except Exception as e:
+        #         logging.warning(f"[MinerU OSS] 从service_conf.yaml读取配置失败: {e}")
+        
+        # 初始化连接
+        if all([self.access_key, self.secret_key, self.endpoint_url]):
+            self._init_connection()
+        else:
+            logging.warning("[MinerU OSS] OSS配置不完整，将使用系统默认存储")
+    
+    def _load_from_service_conf(self):
+        """从service_conf.yaml加载配置"""
+        import yaml
+        conf_path = os.path.join(os.path.dirname(__file__), '..', '..', 'docker', 'service_conf.yaml')
+        if not os.path.exists(conf_path):
+            conf_path = '/ragflow/conf/service_conf.yaml'
+        
+        if os.path.exists(conf_path):
+            with open(conf_path, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            oss_config = config.get('oss', {})
+            if not self.access_key:
+                self.access_key = oss_config.get('access_key')
+            if not self.secret_key:
+                self.secret_key = oss_config.get('secret_key')
+            if not self.endpoint_url:
+                self.endpoint_url = oss_config.get('endpoint_url')
+            if not self.bucket:
+                self.bucket = oss_config.get('bucket') or 'imagetemps'
+            if not self.prefix_path:
+                self.prefix_path = oss_config.get('prefix_path', '')
+    
+    def _init_connection(self):
+        """初始化OSS连接"""
+        try:
+            import boto3
+            from botocore.config import Config
+            
+            config = Config(
+                signature_version='s3',
+                s3={'addressing_style': 'virtual'}
+            )
+            
+            self.conn = boto3.client(
+                's3',
+                region_name=self.region,
+                aws_access_key_id=self.access_key,
+                aws_secret_access_key=self.secret_key,
+                endpoint_url=self.endpoint_url,
+                config=config
+            )
+            logging.info(f"[MinerU OSS] 连接成功: {self.endpoint_url}, bucket={self.bucket}")
+        except Exception as e:
+            logging.error(f"[MinerU OSS] 连接失败: {e}")
+            self.conn = None
+    
+    def is_available(self):
+        """检查OSS是否可用"""
+        return self.conn is not None
+    
+    def upload(self, objname: str, binary: bytes, content_type: str = None) -> bool:
+        """
+        上传文件到OSS
+        
+        Args:
+            objname: OSS对象名
+            binary: 文件二进制数据
+            content_type: MIME类型
+            
+        Returns:
+            bool: 是否上传成功
+        """
+        if not self.is_available():
+            logging.error("[MinerU OSS] OSS未初始化，无法上传")
+            return False
+        
+        # 构建完整key
+        if self.prefix_path:
+            object_key = f"{self.prefix_path}/{objname}"
+        else:
+            object_key = objname
+        
+        try:
+            extra_args = {}
+            if content_type:
+                extra_args['ContentType'] = content_type
+            
+            self.conn.upload_fileobj(
+                BytesIO(binary),
+                self.bucket,
+                object_key,
+                ExtraArgs=extra_args
+            )
+            logging.debug(f"[MinerU OSS] 上传成功: {object_key}")
+            return True
+        except Exception as e:
+            logging.error(f"[MinerU OSS] 上传失败 {object_key}: {e}")
+            return False
+    
+    def get_presigned_url(self, objname: str, expires: int = 3600) -> str:
+        """
+        获取预签名URL
+        
+        Args:
+            objname: OSS对象名
+            expires: 过期时间(秒)
+            
+        Returns:
+            str: 预签名URL
+        """
+        if not self.is_available():
+            return None
+        
+        if self.prefix_path:
+            object_key = f"{self.prefix_path}/{objname}"
+        else:
+            object_key = objname
+        
+        try:
+            url = self.conn.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self.bucket, 'Key': object_key},
+                ExpiresIn=expires
+            )
+            return url
+        except Exception as e:
+            logging.error(f"[MinerU OSS] 生成预签名URL失败: {e}")
+            return None
+    
+    def get_direct_url(self, objname: str) -> str:
+        """
+        获取直接访问URL (需bucket公共读)
+        
+        Args:
+            objname: OSS对象名
+            
+        Returns:
+            str: 直接访问URL
+        """
+        if self.prefix_path:
+            object_key = f"{self.prefix_path}/{objname}"
+        else:
+            object_key = objname
+        
+        # 虚拟主机风格URL
+        endpoint = self.endpoint_url.rstrip('/')
+        url = f"{endpoint.replace('://', f'://{self.bucket}.')}/{object_key}"
+        return url
+
+
 
 class MinerUContentType(StrEnum):
     IMAGE = "image"
@@ -624,7 +816,7 @@ class MinerUParser(RAGFlowPdfParser):
         images_info: dict,
         tenant_id: Optional[str] = None,
         kb_id: Optional[str] = None,
-        bucket: str = "imagetemps"
+        bucket: str = "public"
     ) -> Tuple[str, dict]:
         """
         上传markdown中的所有图片到MinIO，并替换引用为MinIO URL
@@ -710,25 +902,54 @@ class MinerUParser(RAGFlowPdfParser):
                 img_bytes = base64.b64decode(base64_part)
                 logger.debug(f"[MinerU]   解码成功，图片字节数: {len(img_bytes)}")
 
-                # 验证图片格式
+                # 验证图片格式并获取MIME类型
+                img_format = None
+                mime_type = "image/png"  # 默认MIME类型
                 try:
                     img_obj = Image.open(BytesIO(img_bytes))
-                    logger.debug(f"[MinerU]   图片格式: {img_obj.format}, 尺寸: {img_obj.size}")
+                    img_format = img_obj.format
+                    logger.debug(f"[MinerU]   图片格式: {img_format}, 尺寸: {img_obj.size}")
+                    # 根据PIL格式映射到MIME类型
+                    format_to_mime = {
+                        'JPEG': 'image/jpeg',
+                        'JPG': 'image/jpeg',
+                        'PNG': 'image/png',
+                        'GIF': 'image/gif',
+                        'WEBP': 'image/webp',
+                        'BMP': 'image/bmp',
+                        'TIFF': 'image/tiff',
+                    }
+                    mime_type = format_to_mime.get(img_format, 'image/png')
                 except Exception as img_err:
                     logger.warning(f"[MinerU]   图片格式验证失败: {img_err}")
 
-                # 生成唯一的minio_id
+                # 生成唯一的minio_id，带上图片后缀名
                 id_source = f"{tenant_id or ''}_{kb_id or ''}_{img_path}"
                 logger.debug(f"[MinerU]   id_source: {id_source[:50]}...")
 
+                # 从原始路径提取扩展名（默认png）
+                img_ext = Path(img_path).suffix.lower()
+                if not img_ext or img_ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
+                    # 根据MIME类型推断扩展名
+                    ext_from_mime = {
+                        'image/jpeg': '.jpg',
+                        'image/png': '.png',
+                        'image/gif': '.gif',
+                        'image/webp': '.webp',
+                        'image/bmp': '.bmp',
+                    }
+                    img_ext = ext_from_mime.get(mime_type, '.png')
+                
                 obj_hash = xxhash.xxh64(id_source.encode()).hexdigest()
-                objname = f"{tenant_id or 'ragflow'}_{obj_hash[:16]}"
-                minio_id = f"{bucket}-{objname}"
+                objname = f"{tenant_id or 'multi'}_{obj_hash[:16]}{img_ext}"
+                minio_id = f"{'public'}-{objname}"  # API 端点需要 bucket-objname 格式
+                
+                logger.debug(f"[MinerU]   图片扩展名: {img_ext}, objname: {objname}, minio_id: {minio_id}")
 
                 #logger.info(f"[MinerU]   -> minio_id: {minio_id}")
 
                 image_mapping[img_path] = minio_id
-                upload_tasks.append((img_path, img_bytes, minio_id, objname))
+                upload_tasks.append((img_path, img_bytes, minio_id, objname, mime_type))
 
             except Exception as e:
                 logger.warning(f"[MinerU] [跳过] 解码图片 '{img_path}' 失败: {e}")
@@ -742,15 +963,36 @@ class MinerUParser(RAGFlowPdfParser):
         upload_failed = 0
         if upload_tasks:
             def upload_single(task):
-                img_path, img_bytes, minio_id, objname = task
+                img_path, img_bytes, minio_id, objname, mime_type = task
                 nonlocal upload_success, upload_failed
                 try:
-                    from common import settings
-                    #logger.info(f"[MinerU] [上传开始] {img_path} -> {objname}, 大小={len(img_bytes)} bytes")
-                    settings.STORAGE_IMPL.put(bucket=bucket, fnm=objname, binary=img_bytes)
-                    #logger.info(f"[MinerU] [上传成功] {objname}")
-                    upload_success += 1
-                    return True
+                    # 使用MinerU专用OSS上传器
+                    oss_uploader = MinerUOSSUploader()
+                    
+                    if oss_uploader.is_available():
+                        # 使用独立OSS上传
+                        success = oss_uploader.upload(objname, img_bytes, content_type=mime_type)
+                        if success:
+                            # 获取访问URL (优先使用预签名URL)
+                            presigned_url = oss_uploader.get_presigned_url(objname, expires=3600*24*7)
+                            if presigned_url:
+                                logger.debug(f"[MinerU] [OSS上传成功] {objname}, URL: {presigned_url[:80]}...")
+                            else:
+                                logger.debug(f"[MinerU] [OSS上传成功] {objname}")
+                            upload_success += 1
+                            return True
+                        else:
+                            logger.warning(f"[MinerU] [OSS上传失败] {objname}")
+                            upload_failed += 1
+                            return False
+                    else:
+                        # 回退到系统默认存储
+                        from common import settings
+                        settings.STORAGE_IMPL.put(bucket, fnm=objname, binary=img_bytes, content_type=mime_type)
+                        logger.debug(f"[MinerU] [系统存储上传成功] {objname}")
+                        upload_success += 1
+                        return True
+                        
                 except Exception as e:
                     logger.warning(f"[MinerU] [上传失败] {objname}: {e}")
                     upload_failed += 1
@@ -789,9 +1031,10 @@ class MinerUParser(RAGFlowPdfParser):
 
             if img_path in image_mapping:
                 minio_id = image_mapping[img_path]
-                new_ref = f"![{alt_text}]({self.mineru_image_pre_url}{minio_id})"
+                # minio_id格式: bucket-objname，去掉bucket前缀只保留objname
+                objname_only = minio_id.split("-", 1)[1] if "-" in minio_id else minio_id
+                new_ref = f"![{alt_text}]({self.mineru_image_pre_url}{objname_only})"
                 replaced_count += 1
-                logger.debug(f"[MinerU]   替换: {img_path} -> minio://{minio_id}")
                 # 检查图片前是否有足够的换行（确保表格后图片能正确渲染）
                 if prefix:
                     if prefix.endswith('>'):
@@ -1224,7 +1467,7 @@ class MinerUParser(RAGFlowPdfParser):
                     images_info=images_info,
                     tenant_id=tenant_id,
                     kb_id=kb_id,
-                    bucket="multi"
+                    bucket="public"
                 )
                 
                 self.logger.info(f"[MinerU] upload_and_replace_images_in_markdown返回: image_mapping大小={len(image_mapping)}")

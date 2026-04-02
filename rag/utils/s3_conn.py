@@ -133,12 +133,16 @@ class RAGFlowS3:
     @use_default_bucket
     def put(self, bucket, fnm, binary, *args, **kwargs):
         logging.debug(f"bucket name {bucket}; filename :{fnm}:")
+        content_type = kwargs.get('content_type')
         for _ in range(1):
             try:
                 if not self.bucket_exists(bucket):
                     self.conn[0].create_bucket(Bucket=bucket)
                     logging.info(f"create bucket {bucket} ********")
-                r = self.conn[0].upload_fileobj(BytesIO(binary), bucket, fnm)
+                extra_args = {}
+                if content_type:
+                    extra_args['ContentType'] = content_type
+                r = self.conn[0].upload_fileobj(BytesIO(binary), bucket, fnm, ExtraArgs=extra_args)
 
                 return r
             except Exception:

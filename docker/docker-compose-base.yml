@@ -2,7 +2,7 @@ services:
   es01:
     profiles:
       - elasticsearch
-    image: elasticsearch:${STACK_VERSION}
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
     volumes:
       - esdata01:/usr/share/elasticsearch/data
     ports:

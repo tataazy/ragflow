@@ -294,6 +294,7 @@ def init_settings():
 
     global STORAGE_IMPL
     storage_impl = StorageFactory.create(Storage[STORAGE_IMPL_TYPE])
+    logging.info(f"init_settings, storage_impl: {STORAGE_IMPL_TYPE}")
     
     # Define crypto settings
     crypto_enabled = os.environ.get("RAGFLOW_CRYPTO_ENABLED", "false").lower() == "true"

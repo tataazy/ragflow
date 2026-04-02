@@ -814,10 +814,19 @@ async def get_image_back(image_id):
 # @login_required
 async def get_image(image_id):
     try:
-        arr = image_id.split("-")
-        if len(arr) != 2:
-            return get_data_error_result(message="Image not found.")
-        bkt, nm = image_id.split("-")
+        # 支持两种格式:
+        # 1. bucket-objname (完整格式，如: imagetemps-multi_xxx.png)
+        # 2. objname (仅对象名，如: multi_xxx.png，使用默认bucket)
+        if "-" in image_id:
+            arr = image_id.split("-")
+            if len(arr) < 2:
+                return get_data_error_result(message="Image not found.")
+            bkt = arr[0]
+            nm = "-".join(arr[1:])
+        else:
+            # 没有bucket前缀，使用默认bucket 'imagetemps'
+            bkt = "public"
+            nm = image_id
         data = await thread_pool_exec(settings.STORAGE_IMPL.get, bkt, nm)
         response = await make_response(data)
         response.headers.set("Content-Type", "image/JPEG")

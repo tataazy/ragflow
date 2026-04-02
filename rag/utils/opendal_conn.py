@@ -78,8 +78,8 @@ class OpenDALStorage:
         bucket, fnm, binary = "txtxtxtxt1", "txtxtxtxt1", b"_t@@@1"
         return self._operator.write(f"{bucket}/{fnm}", binary)
 
-    def put(self, bucket, fnm, binary, tenant_id=None):
-        self._operator.write(f"{bucket}/{fnm}", binary)
+    def put(self, bucket, fnm, binary, tenant_id=None, content_type=None):
+        self._operator.write(f"{bucket}/{fnm}", binary, content_type=content_type)
 
     def get(self, bucket, fnm, tenant_id=None):
         return self._operator.read(f"{bucket}/{fnm}")
