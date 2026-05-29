@@ -21,6 +21,7 @@ import httpx
 import numpy as np
 import requests
 from yarl import URL
+#import logging
 
 from common.log_utils import log_exception
 from common.token_utils import num_tokens_from_string, truncate, total_token_count_from_response
@@ -63,7 +64,7 @@ class JinaRerank(Base):
 
     def similarity(self, query: str, texts: list):
         texts = [truncate(t, 8196) for t in texts]
-        data = {"model": self.model_name, "query": query, "documents": texts, "top_n": len(texts)}
+        data = {"model": self.model_name, "query": query, "documents": texts, "top_n": min(len(texts), 10)}
         res = requests.post(self.base_url, headers=self.headers, json=data).json()
         rank = np.zeros(len(texts), dtype=float)
         try:
@@ -124,12 +125,16 @@ class LocalAIRerank(Base):
             "model": self.model_name,
             "query": query,
             "documents": texts,
-            "top_n": len(texts),
+            "top_n": min(len(texts), 10),
         }
         token_count = 0
         for t in texts:
             token_count += num_tokens_from_string(t)
-        res = requests.post(self.base_url, headers=self.headers, json=data).json()
+        resp = requests.post(self.base_url, headers=self.headers, json=data)
+        #logging.info("[OpenAI_APIRerank] Response status: %s", resp.status_code)
+        #logging.info("[OpenAI_APIRerank] Response content: %s", resp.text[:500])
+        resp.raise_for_status()
+        res = resp.json()
         rank = np.zeros(len(texts), dtype=float)
         try:
             for d in res["results"]:
@@ -197,25 +202,38 @@ class OpenAI_APIRerank(Base):
 
     def __init__(self, key, model_name, base_url):
         if base_url.find("/rerank") == -1:
-            self.base_url = urljoin(base_url, "/rerank")
+            # 确保base_url结尾有斜杠，避免urljoin丢失路径
+            if not base_url.endswith('/'):
+                base_url += '/'
+            self.base_url = urljoin(base_url, "rerank")
         else:
             self.base_url = base_url
-        self.headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+        if (base_url.find("aliyuncs.com") == -1):
+            self.headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+        else:
+            self.headers = {"Content-Type": "application/json", "Authorization": f"{key}"}
+
         self.model_name = model_name.split("___")[0]
 
     def similarity(self, query: str, texts: list):
+        #logging.info("[OpenAI_APIRerank] Rerank base_url %s", self.base_url)
+        #logging.info("[OpenAI_APIRerank] Rerank headers %s", self.headers)
         # noway to config Ragflow , use fix setting
         texts = [truncate(t, 500) for t in texts]
         data = {
             "model": self.model_name,
             "query": query,
             "documents": texts,
-            "top_n": len(texts),
+            "top_n": min(len(texts), 10),
         }
         token_count = 0
         for t in texts:
             token_count += num_tokens_from_string(t)
-        res = requests.post(self.base_url, headers=self.headers, json=data).json()
+        resp = requests.post(self.base_url, headers=self.headers, json=data)
+        #logging.info("[OpenAI_APIRerank] Response status: %s", resp.status_code)
+        #logging.info("[OpenAI_APIRerank] Response content: %s", resp.text[:500])
+        resp.raise_for_status()
+        res = resp.json()
         rank = np.zeros(len(texts), dtype=float)
         try:
             for d in res["results"]:
@@ -365,13 +383,29 @@ class QWenRerank(Base):
 
         self.api_key = key
         self.model_name = dashscope.TextReRank.Models.gte_rerank if model_name is None else model_name
+        # Remove invalid global timeout, use official SDK per-request timeout parameter
+        self.request_timeout = 30.0
 
     def similarity(self, query: str, texts: list):
         from http import HTTPStatus
 
         import dashscope
+        # Pass official request_timeout parameter to both API call branches
+        if self.model_name.startswith("qwen3-rerank"):
+            resp = dashscope.TextReRank.call(
+                api_key=self.api_key, model=self.model_name,
+                query=query, documents=texts, top_n=len(texts),
+                request_timeout=self.request_timeout
+            )
+        else:
+            resp = dashscope.TextReRank.call(
+                api_key=self.api_key, model=self.model_name,
+                query=query, documents=texts,
+                top_n=len(texts), return_documents=False,
+                request_timeout=self.request_timeout
+            )
 
-        resp = dashscope.TextReRank.call(api_key=self.api_key, model=self.model_name, query=query, documents=texts, top_n=len(texts), return_documents=False)
+        #resp = dashscope.TextReRank.call(api_key=self.api_key, model=self.model_name, query=query, documents=texts, top_n=len(texts), return_documents=False)
         rank = np.zeros(len(texts), dtype=float)
         if resp.status_code == HTTPStatus.OK:
             try:
