@@ -1037,35 +1037,77 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
     overlapped_percent = normalize_overlapped_percent(parser_config.get("overlapped_percent", 0))
     if is_markdown:
         if use_smart_chunking and smart_chunker:
-            logging.info("is_markdown and smart_chunker  process!")
-            # 使用智能分割
-            merged_chunks = []
-            merged_images = []
-            
-            # 合并所有sections为一个文本
-            combined_text = ""
-            combined_images = []
-            for idx, sec in enumerate(sections):
-                text = sec[0] if isinstance(sec, tuple) else sec
-                # 严谨的空值检查：确保section_images存在且索引有效
-                sec_image = None
-                if section_images is not None and isinstance(section_images, list) and idx < len(section_images):
-                    sec_image = section_images[idx]
-                combined_text += "\n" + text if combined_text else text
-                combined_images.append(sec_image)
-            
-            # 智能分割
-            text_chunks = smart_chunker.split_document(combined_text, "markdown")
-            
-            # 分配图片到chunks
-            image_chunks = smart_chunker._distribute_images_to_chunks(
-                [sec[0] if isinstance(sec, tuple) else sec for sec in sections],
-                combined_images,
-                text_chunks
-            )
-            
-            merged_chunks = text_chunks
-            merged_images = image_chunks
+            try:
+                logging.info("is_markdown and smart_chunker  process!")
+                # 使用智能分割
+                merged_chunks = []
+                merged_images = []
+                
+                # 合并所有sections为一个文本
+                combined_text = ""
+                combined_images = []
+                for idx, sec in enumerate(sections):
+                    text = sec[0] if isinstance(sec, tuple) else sec
+                    # 严谨的空值检查：确保section_images存在且索引有效
+                    sec_image = None
+                    if section_images is not None and isinstance(section_images, list) and idx < len(section_images):
+                        sec_image = section_images[idx]
+                    combined_text += "\n" + text if combined_text else text
+                    combined_images.append(sec_image)
+                
+                # 智能分割
+                text_chunks = smart_chunker.split_document(combined_text, "markdown")
+                
+                # 分配图片到chunks
+                image_chunks = smart_chunker._distribute_images_to_chunks(
+                    [sec[0] if isinstance(sec, tuple) else sec for sec in sections],
+                    combined_images,
+                    text_chunks
+                )
+                
+                merged_chunks = text_chunks
+                merged_images = image_chunks
+                logging.info("smart_chunker process finished successfully")
+            except Exception as e:
+                logging.error(f"smart_chunker failed, falling back to naive merge: {e}", exc_info=True)
+                # 回退到原始的分块逻辑
+                merged_chunks = []
+                merged_images = []
+                chunk_limit = max(0, int(parser_config.get("chunk_token_num", 128)))
+
+                current_text = ""
+                current_tokens = 0
+                current_image = None
+
+                for idx, sec in enumerate(sections):
+                    text = sec[0] if isinstance(sec, tuple) else sec
+                    sec_tokens = num_tokens_from_string(text)
+                    sec_image = section_images[idx] if section_images and idx < len(section_images) else None
+
+                    if current_text and current_tokens + sec_tokens > chunk_limit:
+                        merged_chunks.append(current_text)
+                        merged_images.append(current_image)
+                        overlap_part = ""
+                        if overlapped_percent > 0:
+                            overlap_len = int(len(current_text) * overlapped_percent / 100)
+                            if overlap_len > 0:
+                                overlap_part = current_text[-overlap_len:]
+                        current_text = overlap_part
+                        current_tokens = num_tokens_from_string(current_text)
+                        current_image = current_image if overlap_part else None
+
+                    if current_text:
+                        current_text += "\n" + text
+                    else:
+                        current_text = text
+                    current_tokens += sec_tokens
+
+                    if sec_image:
+                        current_image = concat_img(current_image, sec_image) if current_image else sec_image
+
+                if current_text:
+                    merged_chunks.append(current_text)
+                    merged_images.append(current_image)
         else:
             # 原有逻辑
             merged_chunks = []

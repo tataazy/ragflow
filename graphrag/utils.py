@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from collections import defaultdict
 from hashlib import md5
@@ -37,7 +38,29 @@ GRAPH_FIELD_SEP = "<SEP>"
 
 ErrorHandlerFn = Callable[[BaseException | None, str | None, dict | None], None]
 
-chat_limiter = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_CHATS", 10)))
+# Lazy-initialized semaphore bound to current event loop
+class _ThreadSafeSemaphore:
+    def __init__(self):
+        self._semaphores = {}
+        self._lock = threading.Lock()
+    
+    def _get_semaphore(self):
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if loop not in self._semaphores:
+                self._semaphores[loop] = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_CHATS", 10)))
+            return self._semaphores[loop]
+    
+    def __aenter__(self):
+        return self._get_semaphore().__aenter__()
+    
+    def __aexit__(self, *args):
+        return self._get_semaphore().__aexit__()
+    
+    def __getattr__(self, name):
+        return getattr(self._get_semaphore(), name)
+
+chat_limiter = _ThreadSafeSemaphore()
 
 
 @dataclasses.dataclass

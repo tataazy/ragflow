@@ -864,20 +864,41 @@ class DocumentService(CommonService):
                     continue
 
                 new_value = upd.get("value")
+                value_type = upd.get("valueType")
                 match_provided = upd.get("match")
+                
+                # Process new value according to valueType
+                processed_value = new_value
+                if value_type == 'list':
+                    # For list type, always ensure it's a list and dedupe
+                    if isinstance(new_value, list):
+                        processed_value = dedupe_list(new_value)
+                    else:
+                        processed_value = [new_value]
+                else:
+                    # For non-list types, take the first element if it's a list
+                    if isinstance(new_value, list) and len(new_value) > 0:
+                        processed_value = new_value[0]
+                
                 if key not in meta:
                     if match_provided:
                         continue
-                    meta[key] = dedupe_list(new_value) if isinstance(new_value, list) else new_value
+                    meta[key] = processed_value
                     changed = True
                     continue
 
                 if isinstance(meta[key], list):
                     if not match_provided:
-                        if isinstance(new_value, list):
-                            meta[key] = dedupe_list(new_value)
+                        if value_type == 'list':
+                            # Keep as list
+                            if isinstance(new_value, list):
+                                meta[key] = dedupe_list(new_value)
+                            else:
+                                meta[key].append(new_value)
+                                meta[key] = dedupe_list(meta[key])
                         else:
-                            meta[key].append(new_value)
+                            # Convert to single value
+                            meta[key] = processed_value
                         changed = True
                     else:
                         match_value = upd.get("match")
@@ -885,21 +906,27 @@ class DocumentService(CommonService):
                         new_list = []
                         for item in meta[key]:
                             if _str_equal(item, match_value):
-                                new_list.append(new_value)
+                                # Use single value even if new_value is a list
+                                single_value = new_value[0] if isinstance(new_value, list) else new_value
+                                new_list.append(single_value)
                                 replaced = True
                             else:
                                 new_list.append(item)
                         if replaced:
-                            meta[key] = dedupe_list(new_list)
+                            if value_type == 'list':
+                                meta[key] = dedupe_list(new_list)
+                            else:
+                                # Convert to single value if needed
+                                meta[key] = new_list[0] if new_list else processed_value
                             changed = True
                 else:
                     if not match_provided:
-                        meta[key] = new_value
+                        meta[key] = processed_value
                         changed = True
                     else:
                         match_value = upd.get("match")
                         if _str_equal(meta[key], match_value):
-                            meta[key] = new_value
+                            meta[key] = processed_value
                             changed = True
             return changed
 

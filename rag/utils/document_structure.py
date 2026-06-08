@@ -41,20 +41,19 @@ class DocumentStructureAnalyzer:
     """文档结构分析器"""
     
     def __init__(self):
-        # 定义各种受保护内容的正则模式
+        # 定义各种受保护内容的正则模式 - 修复灾难性回溯问题
         self.protected_patterns = {
-            'math_block': re.compile(r'\$\$.*?\$\$', re.DOTALL),
-            'image': re.compile(r'!\[[^\]]*\]\([^)]+\)'),
-            'link': re.compile(r'\[[^\]]*\]\([^)]+\)'),
-            'table': re.compile(r'(?:\|[^\n|]+)+\|[\r\n]+(?:\|\s*:?-+:?\s*\|[\r\n]+)?(?:\|[^\n|]+\|[\r\n]+)+'),
+            'math_block': re.compile(r'\$\$[\s\S]*?\$\$', re.DOTALL),
+            'image': re.compile(r'!\[[^\]]*?\]\([^)]*?\)'),
+            'link': re.compile(r'\[[^\]]*?\]\([^)]*?\)'),
+            'table': re.compile(r'(?:\|[^\n|]*?)+\|[\r\n]+(?:\|\s*:?-+:?\s*\|[\r\n]+)?(?:\|[^\n|]*?\|[\r\n]+)+'),
             'code_block': re.compile(r'```[\s\S]*?```'),
             # HTML 表格 (mineru 输出格式) - 使用 (?s) 启用 DOTALL 模式
-            'html_table': re.compile(r'(?s)<table>.*?</table>'),
-            'inline_code': re.compile(r'`[^`]+`'),
-            # 数学公式：$...\%$ 或 $...$ (mineru输出格式如 $3 . 1 \%$)，支持多行
-            # 关键：不要让 [^$] 匹配 \%，否则 \%$ 会被分开
-            # 使用负向前瞻确保 \ 不被 [^$] 匹配
-            'math_inline': re.compile(r'\$[^\$]*(?:\\.[^\$]*)*(?:\%$|\$)', re.DOTALL)
+            'html_table': re.compile(r'(?s)<table>[\s\S]*?</table>'),
+            'inline_code': re.compile(r'`[^`]*?`'),
+            # 数学公式：$...\%$ 或 $...$ (mineru输出格式如 $3.1\%$)，支持多行
+            # 使用原子组和更简单的模式，避免灾难性回溯
+            'math_inline': re.compile(r'\$(?:\\.|[^$\\])*?(?:\%$|\$)', re.DOTALL)
         }
         
         # 标题模式
@@ -943,9 +942,9 @@ class DocumentStructureAnalyzer:
 分割）
         3. 合并跨行的图表标记（表：、图：可能单独成行）
         """
-        # 先合并所有断行的数学公式
+        # 先合并所有断行的数学公式 - 使用更安全的模式，避免灾难性回溯
         # 匹配 $ ... \%$ 或 $ ... $ 模式，支持转义字符和换行
-        text = re.sub(r'\$[^\$]*(?:\\.[^\$]*)*(?:\n[^\$]*)*(?:\%$|\$)',
+        text = re.sub(r'\$(?:\\.|[^$\\])*?(?:\n(?:\\.|[^$\\])*?)*?(?:\%$|\$)',
                       lambda m: m.group(0).replace('\n', ' '),
                       text)
         
