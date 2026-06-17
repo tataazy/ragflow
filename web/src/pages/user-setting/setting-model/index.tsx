@@ -135,9 +135,10 @@ const ModelProviders = () => {
   const {
     mineruVisible,
     hideMineruModal,
-    showMineruModal,
+    showMineruModal: showMineruModalWithParams,
     onMineruOk,
     mineruLoading,
+    mineruInitialValues,
   } = useSubmitMinerU();
 
   const {
@@ -159,7 +160,7 @@ const ModelProviders = () => {
       [LLMFactory.TencentCloud]: showTencentCloudAddingModal,
       [LLMFactory.GoogleCloud]: showGoogleAddingModal,
       [LLMFactory.AzureOpenAI]: showAzureAddingModal,
-      [LLMFactory.MinerU]: showMineruModal,
+      [LLMFactory.MinerU]: showMineruModalWithParams,
       [LLMFactory.PaddleOCR]: showPaddleOCRModal,
     }),
     [
@@ -172,7 +173,7 @@ const ModelProviders = () => {
       showTencentCloudAddingModal,
       showGoogleAddingModal,
       showAzureAddingModal,
-      showMineruModal,
+      showMineruModalWithParams,
       showPaddleOCRModal,
     ],
   );
@@ -320,6 +321,7 @@ const ModelProviders = () => {
         hideModal={hideMineruModal}
         onOk={onMineruOk}
         loading={mineruLoading}
+        initialValues={mineruInitialValues}
       ></MinerUModal>
       <PaddleOCRModal
         visible={paddleocrVisible}

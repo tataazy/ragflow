@@ -351,12 +351,14 @@ class MinerUParseOptions:
 
 
 class MinerUParser(RAGFlowPdfParser):
-    def __init__(self, mineru_path: str = "mineru", mineru_api: str = "", mineru_server_url: str = "", mineru_image_pre_url: str = ""):
+    def __init__(self, mineru_path: str = "mineru", mineru_api: str = "", mineru_server_url: str = "", mineru_image_pre_url: str = "", mineru_api_token: str = ""):
         self.mineru_api = mineru_api.rstrip("/")
         self.mineru_server_url = mineru_server_url.rstrip("/")
         self.mineru_image_pre_url = mineru_image_pre_url
+        self.mineru_api_token = mineru_api_token
         self.outlines = []
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.info(f"[MinerUParser] Initialized with mineru_api={self.mineru_api}, token={'set' if self.mineru_api_token else 'not set'}")
         self.b64_data_uri_pattern = re.compile(r'^data:image/(\w+);base64,(.+)$')
         self.image_ref_pattern = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
 
@@ -520,11 +522,18 @@ class MinerUParser(RAGFlowPdfParser):
                     shutil.copyfileobj(src, dst)
 
     @staticmethod
-    def _is_http_endpoint_valid(url, timeout=5):
+    def _is_http_endpoint_valid(url, timeout=5, headers=None, method='head'):
         try:
-            response = requests.head(url, timeout=timeout, allow_redirects=True)
+            logger = logging.getLogger(__name__)
+            logger.info(f"[MinerUParser._is_http_endpoint_valid] Checking {url} with method={method}, headers keys: {list(headers.keys()) if headers else 'None'}")
+            if method == 'head':
+                response = requests.head(url, timeout=timeout, allow_redirects=True, headers=headers or {})
+            else:
+                response = requests.get(url, timeout=timeout, allow_redirects=True, headers=headers or {})
+            logger.info(f"[MinerUParser._is_http_endpoint_valid] {url} status code: {response.status_code}")
             return response.status_code in [200, 301, 302, 307, 308]
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[MinerUParser._is_http_endpoint_valid] Error checking {url}: {e}")
             return False
 
     def check_installation(self, backend: str = "pipeline", server_url: Optional[str] = None) -> tuple[bool, str]:
@@ -541,15 +550,40 @@ class MinerUParser(RAGFlowPdfParser):
             self.logger.warning(reason)
             return False, reason
 
-        api_openapi = f"{self.mineru_api}/openapi.json"
-        try:
-            api_ok = self._is_http_endpoint_valid(api_openapi)
-            self.logger.info(f"[MinerU] API openapi.json reachable={api_ok} url={api_openapi}")
-            if not api_ok:
-                reason = f"[MinerU] MinerU API not accessible: {api_openapi}"
-                return False, reason
-        except Exception as exc:
-            reason = f"[MinerU] MinerU API check failed: {exc}"
+        self.logger.info(f"[MinerUParser.check_installation] mineru_api_token={self.mineru_api_token[:10] if self.mineru_api_token else 'None'}...")
+        
+        # 准备 headers
+        check_headers = {}
+        if self.mineru_api_token:
+            if self.mineru_api_token.lower().startswith("bearer "):
+                check_headers["Authorization"] = self.mineru_api_token
+            else:
+                check_headers["Authorization"] = f"Bearer {self.mineru_api_token}"
+            self.logger.info(f"[MinerUParser.check_installation] Added Authorization header to check_headers")
+        
+        # 尝试多个可能的健康检查端点，兼容不同部署环境
+        health_endpoints = [
+            (f"{self.mineru_api}/openapi.json", 'head'),       # 原默认端点
+            (f"{self.mineru_api}/health", 'get'),              # 标准健康检查
+            (f"{self.mineru_api}/healthz", 'get'),             # k8s 风格
+        ]
+        
+        api_ok = False
+        last_tried_url = ""
+        for endpoint_url, http_method in health_endpoints:
+            last_tried_url = endpoint_url
+            try:
+                self.logger.info(f"[MinerU] Trying to check API reachability: {endpoint_url} (method={http_method})")
+                current_ok = self._is_http_endpoint_valid(endpoint_url, headers=check_headers, method=http_method)
+                self.logger.info(f"[MinerU] API endpoint {endpoint_url} reachable={current_ok}")
+                if current_ok:
+                    api_ok = True
+                    break  # 找到一个可用的端点就退出
+            except Exception as exc:
+                self.logger.warning(f"[MinerU] API check failed for {endpoint_url}: {exc}")
+        
+        if not api_ok:
+            reason = f"[MinerU] MinerU API not accessible. Tried endpoints: {[e[0] for e in health_endpoints]}"
             self.logger.warning(reason)
             return False, reason
 
@@ -611,6 +645,14 @@ class MinerUParser(RAGFlowPdfParser):
         self.logger.info(f"[MinerU] request {options=}")
 
         headers = {"Accept": "application/json"}
+        # 添加 Authorization token
+        if self.mineru_api_token:
+            # 如果 token 已经以 Bearer 开头，就直接使用；否则添加 Bearer 前缀
+            if self.mineru_api_token.lower().startswith("bearer "):
+                headers["Authorization"] = self.mineru_api_token
+            else:
+                headers["Authorization"] = f"Bearer {self.mineru_api_token}"
+            self.logger.info(f"[MinerU] Added Authorization header with token")
         try:
             self.logger.info(f"[MinerU] invoke api: {self.mineru_api}/file_parse backend={options.backend} server_url={data.get('server_url')}")
             if callback:

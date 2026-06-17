@@ -18,26 +18,28 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { t } from 'i18next';
 import { useForm, useWatch } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
+import { useEffect } from 'react';
 import { z } from 'zod';
 import { LLMHeader } from '../../components/llm-header';
 
 const FormSchema = z.object({
-  llm_name: z.string().min(1, {
-    message: t('setting.mineru.modelNameRequired'),
-  }),
-  mineru_apiserver: z.string().url(),
-  mineru_output_dir: z.string().optional(),
-  mineru_backend: z.enum([
-    'pipeline',
-    'vlm-transformers',
-    'vlm-vllm-engine',
-    'vlm-http-client',
-    'vlm-mlx-engine',
-    'vlm-vllm-async-engine',
-    'vlm-lmdeploy-engine',
-  ]),
-  mineru_server_url: z.string().url().optional(),
-  mineru_delete_output: z.boolean(),
+    llm_name: z.string().min(1, {
+        message: t('setting.mineru.modelNameRequired'),
+    }),
+    mineru_apiserver: z.string().url(),
+    mineru_output_dir: z.string().optional(),
+    mineru_backend: z.enum([
+        'pipeline',
+        'vlm-transformers',
+        'vlm-vllm-engine',
+        'vlm-http-client',
+        'vlm-mlx-engine',
+        'vlm-vllm-async-engine',
+        'vlm-lmdeploy-engine',
+    ]),
+    mineru_server_url: z.string().url().optional(),
+    mineru_delete_output: z.boolean(),
+    mineru_api_token: z.string().optional(),
 });
 
 export type MinerUFormValues = z.infer<typeof FormSchema>;
@@ -47,6 +49,7 @@ const MinerUModal = ({
   hideModal,
   onOk,
   loading,
+  initialValues,
 }: IModalProps<MinerUFormValues>) => {
   const { t } = useTranslation();
 
@@ -67,6 +70,24 @@ const MinerUModal = ({
       mineru_delete_output: true,
     },
   });
+  
+  // 当 visible 或 initialValues 改变时，重置表单
+  useEffect(() => {
+    if (visible) {
+      if (initialValues) {
+        form.reset({
+          mineru_backend: 'pipeline',
+          mineru_delete_output: true,
+          ...initialValues,
+        });
+      } else {
+        form.reset({
+          mineru_backend: 'pipeline',
+          mineru_delete_output: true,
+        });
+      }
+    }
+  }, [visible, initialValues, form]);
 
   const backend = useWatch({
     control: form.control,
@@ -102,17 +123,23 @@ const MinerUModal = ({
               <Input placeholder="mineru-from-env-1" />
             </RAGFlowFormItem>
             <RAGFlowFormItem
-              name="mineru_apiserver"
-              label={t('setting.mineru.apiserver')}
-              required
+                name="mineru_apiserver"
+                label={t('setting.mineru.apiserver')}
+                required
             >
-              <Input placeholder="http://host.docker.internal:9987" />
+                <Input placeholder="http://host.docker.internal:9987" />
             </RAGFlowFormItem>
             <RAGFlowFormItem
-              name="mineru_output_dir"
-              label={t('setting.mineru.outputDir')}
+                name="mineru_api_token"
+                label={t('setting.mineru.apiToken')}
             >
-              <Input placeholder="/tmp/mineru" />
+                <Input placeholder="Bearer your-token-here" />
+            </RAGFlowFormItem>
+            <RAGFlowFormItem
+                name="mineru_output_dir"
+                label={t('setting.mineru.outputDir')}
+            >
+                <Input placeholder="/tmp/mineru" />
             </RAGFlowFormItem>
             <RAGFlowFormItem
               name="mineru_backend"

@@ -11,6 +11,7 @@ import {
   useSaveTenantInfo,
   useSelectLlmOptionsByModelType,
 } from '@/hooks/use-llm-request';
+import { useState } from 'react';
 import { useFetchTenantInfo } from '@/hooks/use-user-setting-request';
 import { IAddLlmRequestBody } from '@/interfaces/request/llm';
 import { getRealModelName } from '@/utils/llm-util';
@@ -464,6 +465,7 @@ export const useHandleDeleteFactory = (llmFactory: string) => {
 
 export const useSubmitMinerU = () => {
   const { addLlm, loading } = useAddLlm();
+  const [initialValues, setInitialValues] = useState<Partial<MinerUFormValues>>();
   const {
     visible: mineruVisible,
     hideModal: hideMineruModal,
@@ -496,12 +498,33 @@ export const useSubmitMinerU = () => {
     [addLlm, hideMineruModal],
   );
 
+  const handleShowMineruModal = useCallback((llmFactory: string, isEdit = false, modelData?: any, detailedData?: any) => {
+    if (isEdit && detailedData) {
+      // 解析保存的配置
+      const savedCfg = typeof detailedData.api_key === 'string' ? 
+        JSON.parse(detailedData.api_key) : detailedData.api_key;
+      setInitialValues({
+        llm_name: getRealModelName(detailedData.name),
+        mineru_apiserver: savedCfg?.mineru_apiserver ?? '',
+        mineru_output_dir: savedCfg?.mineru_output_dir ?? '',
+        mineru_backend: savedCfg?.mineru_backend ?? 'pipeline',
+        mineru_server_url: savedCfg?.mineru_server_url ?? '',
+        mineru_delete_output: savedCfg?.mineru_delete_output === '1' ?? true,
+        mineru_api_token: savedCfg?.mineru_api_token ?? '',
+      });
+    } else {
+      setInitialValues(undefined);
+    }
+    showMineruModal();
+  }, [showMineruModal]);
+
   return {
     mineruVisible,
     hideMineruModal,
-    showMineruModal,
+    showMineruModal: handleShowMineruModal,
     onMineruOk,
     mineruLoading: loading,
+    mineruInitialValues: initialValues,
   };
 };
 

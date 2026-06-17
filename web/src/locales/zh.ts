@@ -1119,6 +1119,7 @@ General：实体和关系提取提示来自 GitHub - microsoft/graphrag：基于
         apiServerRequired: 'MinerU API服务器配置为必填项',
         serverUrlBackendLimit: '仅在backend 为vlm-http-client 时可填写',
         apiserver: 'MinerU API服务器配置',
+        apiToken: 'MinerU API访问令牌',
         outputDir: 'MinerU输出目录路径',
         backend: 'MinerU处理后端类型',
         serverUrl: 'MinerU服务器URL地址',

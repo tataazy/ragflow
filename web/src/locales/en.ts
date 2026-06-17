@@ -1249,6 +1249,7 @@ Example: Virtual Hosted Style`,
         serverUrlBackendLimit:
           'MinerU Server URL Address is only available for the HTTP client backend',
         apiserver: 'MinerU API Server Configuration',
+        apiToken: 'MinerU API Access Token',
         outputDir: 'MinerU Output Directory Path',
         backend: 'MinerU Processing Backend Type',
         serverUrl: 'MinerU Server URL Address',
