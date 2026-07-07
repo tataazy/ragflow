@@ -596,6 +596,36 @@ Example: A 1 KB message with 1024-dim embedding uses ~9 KB. The 5 MB default lim
     </p><p>
     Applicable when you require the LLM to summarize the entire document, provided it can handle that amount of context length.
     </p>`,
+      useGraphRagSAG: 'Enable SAG GraphRAG',
+      useGraphRagSAGTip: 'Use SAG-style graph retrieval for multi-hop question answering',
+      entityTypes: 'Entity Types',
+      entityTypesTip: 'Entity types to extract: person, organization, location, product, metric, etc.',
+      maxHops: 'Max Hops',
+      maxHopsTip: 'Maximum number of hops for graph traversal (0-3)',
+      entityTopK: 'Entity TopK',
+      entityTopKTip: 'Number of top entities to retrieve',
+      multiTopK: 'Multi TopK',
+      multiTopKTip: 'Number of candidate events to retrieve in multi-hop search',
+      rerankTopK: 'Rerank TopK',
+      rerankTopKTip: 'Number of events to return after reranking',
+      maxSections: 'Max Sections',
+      maxSectionsTip: 'Maximum number of result sections to return',
+      standardMode: 'Standard',
+      fastMode: 'Fast',
+      standardModeTip: 'LLM extracts entities for more accurate retrieval',
+      fastModeTip: 'BM25 keyword matching for faster retrieval',
+      graphragSAGTitle: 'SAG GraphRAG',
+      graphragSAGDescription: 'Graph-based retrieval using Event-Entity relationships',
+      graphragSAGBuild: 'Build Graph Index',
+      graphragSAGBuildTip: 'Build graph index for SAG GraphRAG retrieval',
+      graphragSAGStats: 'Graph Statistics',
+      graphragSAGEvents: 'Events',
+      graphragSAGEntities: 'Entities',
+      graphragSAGRelations: 'Relations',
+      graphragSAGChunks: 'Chunks',
+      graphragSAGTesting: 'GraphRAG Retrieval Test',
+      graphragSAGTestingDesc: 'Test SAG-style graph retrieval results',
+
       knowledgeGraph: `<p>Supported file formats are <b>DOCX, EXCEL, PPT, IMAGE, PDF, TXT, MD, JSON, EML</b>
 
 <p>This approach chunks files using the 'naive'/'General' method. It splits a document into segments and then combines adjacent segments until the token count exceeds the threshold specified by 'Chunk token number for text', at which point a chunk is created.</p>

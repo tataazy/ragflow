@@ -173,6 +173,35 @@ services:
       retries: 120
     restart: unless-stopped
 
+  postgres-pgvector:
+    image: pgvector/pgvector:pg16
+    hostname: postgres-pgvector
+    env_file: .env
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-ragflow_pgvector}
+      - POSTGRES_DB=${POSTGRES_DB:-vector_db}
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=vector"
+      - "-c"
+      - "vector.dim=1536"
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+    networks:
+      - ragflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    restart: unless-stopped
+    profiles:
+      - ${SAG_ENABLED:-0}
+
   mysql:
     # mysql:5.7 linux/arm64 image is unavailable.
     image: mysql:8.0.39
@@ -318,6 +347,8 @@ volumes:
   tei_data:
     driver: local
   kibana_data:
+    driver: local
+  pgvector_data:
     driver: local
 
 networks:

@@ -300,4 +300,50 @@ export function deletePipelineTask({
   return request.delete(api.unbindPipelineTask({ kb_id, type }));
 }
 
+// ============== SAG GraphRAG Service Functions ==============
+
+export const initGraphRAGSAG = () => request.post(api.graphragSagInit);
+
+export const searchGraphRAGSAG = (params: {
+  kb_id: string;
+  query: string;
+  mode?: 'vector' | 'multi';
+  search_mode?: 'standard' | 'fast';
+  top_k?: number;
+  multi_options?: {
+    entity_top_k?: number;
+    max_hops?: number;
+    rerank_top_k?: number;
+    max_sections?: number;
+  };
+}) => request.post(api.graphragSagSearch, { data: params });
+
+export const buildGraphRAGSAG = (params: {
+  kb_id: string;
+  doc_ids?: string[];
+  parser_config?: {
+    llm_id?: string;
+    emb_id?: string;
+    entity_types?: string[];
+    chunk_token_num?: number;
+  };
+}) => request.post(api.graphragSagBuild, { data: params });
+
+export const getGraphRAGSAGStats = (kbId: string) =>
+  request.get(api.getGraphRAGSAGStats(kbId));
+
+export const getGraphRAGSAGGraph = (kbId: string, limit = 100) =>
+  request.get(api.getGraphRAGSAGGraph(kbId));
+
+export const deleteGraphRAGSAG = (kbId: string) =>
+  request.post(api.deleteGraphRAGSAG(kbId));
+
+export const retrievalTestGraphRAGSAG = (params: {
+  kb_id: string;
+  question: string;
+  mode?: 'vector' | 'multi';
+  search_mode?: 'standard' | 'fast';
+  top_k?: number;
+}) => request.post(api.graphragSagRetrievalTest, { data: params });
+
 export default kbService;

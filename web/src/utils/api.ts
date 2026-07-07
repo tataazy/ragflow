@@ -72,6 +72,18 @@ export default {
   fetchPipelineDatasetLogs: `${api_host}/kb/list_pipeline_dataset_logs`,
   runGraphRag: `${api_host}/kb/run_graphrag`,
   traceGraphRag: `${api_host}/kb/trace_graphrag`,
+
+  // SAG GraphRAG
+  graphragSagInit: `${api_host}/graphrag_sag/init`,
+  graphragSagSearch: `${api_host}/graphrag_sag/search`,
+  graphragSagBuild: `${api_host}/graphrag_sag/build`,
+  graphragSagStats: `${api_host}/graphrag_sag/stats`,
+  graphragSagDelete: `${api_host}/graphrag_sag/delete`,
+  graphragSagGraph: `${api_host}/graphrag_sag/graph`,
+  graphragSagRetrievalTest: `${api_host}/graphrag_sag/retrieval_test`,
+  getGraphRAGSAGGraph: (kbId: string) => `${api_host}/graphrag_sag/graph?kb_id=${kbId}&limit=100`,
+  getGraphRAGSAGStats: (kbId: string) => `${api_host}/graphrag_sag/stats?kb_id=${kbId}`,
+  deleteGraphRAGSAG: (kbId: string) => `${api_host}/graphrag_sag/delete`,
   runRaptor: `${api_host}/kb/run_raptor`,
   traceRaptor: `${api_host}/kb/trace_raptor`,
   unbindPipelineTask: ({ kb_id, type }: { kb_id: string; type: string }) =>

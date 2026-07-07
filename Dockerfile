@@ -161,7 +161,9 @@ RUN --mount=type=cache,id=ragflow_uv,target=/root/.cache/uv,sharing=locked \
     export UV_HTTP_TIMEOUT=300 && \
     uv sync --python 3.12 --frozen && \
     # Ensure pip is available in the venv for runtime package installation (fixes #12651)
-    .venv/bin/python3 -m ensurepip --upgrade
+    .venv/bin/python3 -m ensurepip --upgrade && \
+    # Install asyncpg for SAG GraphRAG (not in uv.lock yet)
+    .venv/bin/python3 -m pip install asyncpg
 
 # Copy frontend package files first to leverage Docker layer caching for npm install
 COPY web/package.json web/package-lock.json* ./web/
