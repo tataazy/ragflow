@@ -144,6 +144,14 @@ def reset_document_for_reparse(doc, tenant_id, parser_id=None, pipeline_id=None)
     except Exception as e:
         logging.error(f"error when delete chunk images:{e}")
 
+    # Cleanup SAG data so re-extraction does not duplicate old events
+    try:
+        from rag.sag.cleanup import cleanup_sag_data_for_docs
+
+        cleanup_sag_data_for_docs([doc.id], doc.kb_id, tenant_id)
+    except Exception as e:
+        logging.warning(f"Failed to cleanup SAG data for document {doc.id}: {e}")
+
     return None
 
 

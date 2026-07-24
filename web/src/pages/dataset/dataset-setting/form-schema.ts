@@ -92,6 +92,17 @@ export const formSchema = z
               path: ['entity_types'],
             },
           ),
+        sag: z
+          .object({
+            enabled: z.boolean().optional(),
+            extract_model: z.string().optional(),
+            extract_concurrency: z.number().optional(),
+            chunk_max_tokens: z.number().optional(),
+            search_strategy: z.string().optional(),
+            search_top_k: z.number().optional(),
+            hop_num: z.number().optional(),
+          })
+          .optional(),
         metadata: z.any().optional(),
         built_in_metadata: z
           .array(

@@ -1089,6 +1089,19 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
     ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], tenant_ids)
     ranks["total"] = len(ranks["chunks"])
 
+    # SAG augmentation (auto-triggered for SAG-enabled knowledge bases)
+    from rag.sag.retriever import augment_with_sag
+    sag_chat_mdl = None
+    try:
+        sag_chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
+        sag_chat_mdl = LLMBundle(kb.tenant_id, sag_chat_model_config)
+    except Exception:
+        pass
+    sag_chunks = await augment_with_sag(_question, tenant_ids, [dataset_id], embd_mdl, sag_chat_mdl, ranks["chunks"])
+    if sag_chunks:
+        ranks["chunks"].extend(sag_chunks)
+        ranks["total"] = len(ranks["chunks"])
+
     for c in ranks["chunks"]:
         c.pop("vector", None)
     ranks["labels"] = labels
@@ -1481,6 +1494,19 @@ async def search_datasets(tenant_id: str, req: dict):
             logging.warning("search_datasets KG retrieval failed: datasets=%s tenant=%s", kb_ids, tenant_id, exc_info=True)
     ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], tenant_ids)
     ranks["total"] = len(ranks["chunks"])
+
+    # SAG augmentation (auto-triggered for SAG-enabled knowledge bases)
+    from rag.sag.retriever import augment_with_sag
+    sag_chat_mdl = None
+    try:
+        sag_chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
+        sag_chat_mdl = LLMBundle(kb.tenant_id, sag_chat_model_config)
+    except Exception:
+        pass
+    sag_chunks = await augment_with_sag(_question, tenant_ids, kb_ids, embd_mdl, sag_chat_mdl, ranks["chunks"])
+    if sag_chunks:
+        ranks["chunks"].extend(sag_chunks)
+        ranks["total"] = len(ranks["chunks"])
 
     for c in ranks["chunks"]:
         c.pop("vector", None)

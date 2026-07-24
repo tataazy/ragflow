@@ -352,9 +352,28 @@ def is_chinese(text):
     return False
 
 
+def clean_content_text(txt: str) -> str:
+    """Strip meaningless characters from chunk content to reduce token waste.
+
+    Applied generically before chunks are tokenized/saved:
+    - Remove control characters (keep newline/tab) and zero-width Unicode chars.
+    - Rejoin decimals that OCR split with spaces ("0. 1" -> "0.1").
+    - Collapse runs of horizontal whitespace and strip trailing spaces.
+    """
+    if not txt:
+        return txt
+    txt = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", txt)
+    txt = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", txt)
+    txt = re.sub(r"(\d)[ \t]*\.[ \t]*(\d)", r"\1.\2", txt)
+    txt = re.sub(r"[ \t]{2,}", " ", txt)
+    txt = re.sub(r"[ \t]+\n", "\n", txt)
+    return txt.strip()
+
+
 def tokenize(d, txt, eng, language="English"):
     from . import rag_tokenizer
     rag_tokenizer.tokenizer.set_language(language)
+    txt = clean_content_text(txt)
     d["content_with_weight"] = txt
     t = re.sub(r"</?(table|td|caption|tr|th)( [^<>]{0,12})?>", " ", txt)
     d["content_ltks"] = rag_tokenizer.tokenize(t)
@@ -467,6 +486,7 @@ def tokenize_table(tbls, doc, eng, batch_size=10, language="English"):
         if not rows:
             continue
         if isinstance(rows, str):
+            rows = clean_content_text(rows)
             d = copy.deepcopy(doc)
             tokenize(d, rows, eng, language=language)
             d["content_with_weight"] = rows

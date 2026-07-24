@@ -3,12 +3,15 @@ import Empty from '@/components/empty/empty';
 import { FilterButton } from '@/components/list-filter-bar';
 import { FilterPopover } from '@/components/list-filter-bar/filter-popover';
 import { FilterCollection } from '@/components/list-filter-bar/interface';
+import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
+import { RAGFlowTooltip } from '@/components/ui/tooltip';
 import { useTranslate } from '@/hooks/common-hooks';
 import { useTestRetrieval } from '@/hooks/use-knowledge-request';
 import { ITestingChunk } from '@/interfaces/database/dataset';
 import { t } from 'i18next';
 import camelCase from 'lodash/camelCase';
+import { Sparkles } from 'lucide-react';
 import { useMemo } from 'react';
 
 const similarityList: Array<{ field: keyof ITestingChunk; label: string }> = [
@@ -20,7 +23,25 @@ const similarityList: Array<{ field: keyof ITestingChunk; label: string }> = [
 const ChunkTitle = ({ item }: { item: ITestingChunk }) => {
   const { t } = useTranslate('knowledgeDetails');
   return (
-    <div className="text-xs text-text-sub-title-invert italic space-x-4 rtl:space-x-reverse">
+    <div className="text-xs text-text-sub-title-invert italic space-x-4 rtl:space-x-reverse flex items-center">
+      {item.sag_source && (
+        <RAGFlowTooltip
+          tooltip={
+            <span className="not-italic">
+              {t('sagSourceTooltip')}
+              {item.sag_event_title ? `：${item.sag_event_title}` : ''}
+            </span>
+          }
+        >
+          <Badge
+            variant="success"
+            className="not-italic gap-1 px-1.5 py-0 text-[10px] leading-4"
+          >
+            <Sparkles className="size-3" />
+            SAG
+          </Badge>
+        </RAGFlowTooltip>
+      )}
       {similarityList.map((x) => (
         <p key={x.field} className="inline">
           {((item[x.field] as number) * 100).toFixed(2)}{' '}

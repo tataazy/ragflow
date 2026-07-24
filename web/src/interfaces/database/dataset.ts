@@ -193,6 +193,8 @@ export interface ITestingChunk {
   positions: number[][];
   docnm_kwd: string;
   doc_type_kwd: string;
+  sag_source?: boolean;
+  sag_event_title?: string;
 }
 
 export interface ITestingDocument {

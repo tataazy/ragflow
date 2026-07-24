@@ -374,13 +374,13 @@ class TableStructureRecognizer(Recognizer):
                 txts.append(txt)
                 sp = ""
                 if arr[0].get("colspan"):
-                    sp = "colspan={}".format(arr[0]["colspan"])
+                    sp = " colspan={}".format(arr[0]["colspan"])
                 if arr[0].get("rowspan"):
                     sp += " rowspan={}".format(arr[0]["rowspan"])
                 if i in hdset:
-                    row += f"<th {sp} >" + txt + "</th>"
+                    row += f"<th{sp}>" + txt + "</th>"
                 else:
-                    row += f"<td {sp} >" + txt + "</td>"
+                    row += f"<td{sp}>" + txt + "</td>"
 
             if i in hdset:
                 if all([t in hdset for t in txts]):

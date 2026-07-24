@@ -958,6 +958,12 @@ async def rm_chunk(tenant_id, dataset_id, document_id):
             )
             if chunk_number != 0:
                 DocumentService.decrement_chunk_num(document_id, dataset_id, 1, chunk_number, 0)
+            try:
+                from rag.sag.cleanup import cleanup_sag_data_for_docs
+
+                cleanup_sag_data_for_docs([document_id], dataset_id, dataset_tenant_id)
+            except Exception as e:
+                logging.warning(f"Failed to cleanup SAG data for document {document_id}: {e}")
             return get_result(message=f"deleted {chunk_number} chunks")
         return get_result()
 

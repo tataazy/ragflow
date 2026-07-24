@@ -8,6 +8,7 @@ import {
   LucideLogs,
   LucideSettings,
   LucideTextSearch,
+  LucideNetwork,
 } from 'lucide-react';
 
 import { IconFontFill } from '@/components/icon-font';
@@ -54,6 +55,11 @@ export function SideBar({ dataset: data }: PropType) {
         icon: <LucideSettings className="size-[1em]" />,
         label: t(`knowledgeDetails.configuration`),
         key: Routes.DataSetSetting,
+      },
+      {
+        icon: <LucideNetwork className="size-[1em]" />,
+        label: 'SAG Graph',
+        key: Routes.Sag,
       },
     ];
 

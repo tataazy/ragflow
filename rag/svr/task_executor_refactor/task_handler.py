@@ -161,6 +161,8 @@ class TaskHandler:
             "evaluation",
             "reembedding",
             "clone",
+            "sag_extract",
+            "sag_rebuild",
         } and not task_type.startswith("dataflow")
 
     async def handle_task(self) -> None:
@@ -269,6 +271,10 @@ class TaskHandler:
                 await self._run_reembedding()
             elif task_type == "clone":
                 await self._run_clone()
+            elif task_type == "sag_extract":
+                await self._run_sag_extract()
+            elif task_type == "sag_rebuild":
+                await self._run_sag_rebuild()
             else:
                 await self._run_standard_chunking(embedding_model, vector_size)
 
@@ -303,6 +309,94 @@ class TaskHandler:
         ctx = self._task_context
         ctx.progress_cb(1, "Clone task placeholder")
 
+    async def _maybe_trigger_sag_extract(self) -> None:
+        """Auto-trigger SAG extraction after standard chunking if SAG is enabled."""
+        ctx = self._task_context
+        kb_parser_config = ctx.kb_parser_config or {}
+        sag_config = kb_parser_config.get("sag", {})
+
+        if not sag_config.get("enabled", False):
+            return
+
+        try:
+            from rag.sag.task_queue import queue_sag_extract_task
+
+            task_id = queue_sag_extract_task(
+                doc_id=ctx.doc_id,
+                kb_id=ctx.kb_id,
+                tenant_id=ctx.tenant_id,
+            )
+            logging.info(
+                "[SAG] Auto-triggered sag_extract task %s for doc %s in kb %s",
+                task_id, ctx.doc_id, ctx.kb_id,
+            )
+        except Exception as e:
+            # Non-fatal: log but don't fail the chunking task
+            logging.warning(
+                "[SAG] Failed to auto-trigger sag_extract for doc %s: %s",
+                ctx.doc_id, e,
+            )
+
+    async def _run_sag_extract(self) -> None:
+        """Run SAG extraction task for a single document."""
+        ctx = self._task_context
+        try:
+            from rag.sag.executor import run_sag_extract
+
+            # Bind chat model for extraction
+            chat_model = await self._bind_chat_model()
+            if chat_model is None:
+                ctx.progress_cb(-1, msg="Failed to bind chat model for SAG extraction")
+                return
+
+            # Bind embedding model for event indexing
+            embedding_result = await self._bind_embedding_model()
+            if embedding_result is None:
+                ctx.progress_cb(-1, msg="Failed to bind embedding model for SAG extraction")
+                return
+            embedding_model, _ = embedding_result
+
+            await run_sag_extract(
+                task_context=ctx,
+                chat_model=chat_model,
+                embedding_model=embedding_model,
+                progress_cb=ctx.progress_cb,
+            )
+        except Exception as e:
+            logging.exception(f"SAG extract failed for doc {ctx.doc_id}")
+            ctx.progress_cb(-1, msg=f"SAG extract failed: {str(e)}")
+            raise
+
+    async def _run_sag_rebuild(self) -> None:
+        """Run SAG rebuild task for an entire knowledge base."""
+        ctx = self._task_context
+        try:
+            from rag.sag.executor import run_sag_rebuild
+
+            # Bind chat model for extraction
+            chat_model = await self._bind_chat_model()
+            if chat_model is None:
+                ctx.progress_cb(-1, msg="Failed to bind chat model for SAG rebuild")
+                return
+
+            # Bind embedding model for event indexing
+            embedding_result = await self._bind_embedding_model()
+            if embedding_result is None:
+                ctx.progress_cb(-1, msg="Failed to bind embedding model for SAG rebuild")
+                return
+            embedding_model, _ = embedding_result
+
+            await run_sag_rebuild(
+                task_context=ctx,
+                chat_model=chat_model,
+                embedding_model=embedding_model,
+                progress_cb=ctx.progress_cb,
+            )
+        except Exception as e:
+            logging.exception(f"SAG rebuild failed for kb {ctx.kb_id}")
+            ctx.progress_cb(-1, msg=f"SAG rebuild failed: {str(e)}")
+            raise
+
     async def _bind_embedding_model(self) -> Optional[tuple]:
         """Bind embedding model to task.
 
@@ -327,6 +421,27 @@ class TaskHandler:
             ctx.progress_cb(-1, msg=error_message)
             logging.exception(error_message)
             raise
+
+    async def _bind_chat_model(self) -> Optional[LLMBundle]:
+        """Bind chat model to task.
+
+        Returns:
+            LLMBundle for chat on success, or None on failure.
+        """
+        ctx = self._task_context
+        task_tenant_id = ctx.tenant_id
+        task_llm_id = ctx.kb_parser_config.get("llm_id") or ctx.llm_id
+        task_language = ctx.language
+
+        try:
+            chat_model_config = get_model_config_from_provider_instance(task_tenant_id, LLMType.CHAT, task_llm_id)
+            chat_model = LLMBundle(task_tenant_id, chat_model_config, lang=task_language)
+            return chat_model
+        except Exception as e:
+            error_message = f"Fail to bind chat model: {str(e)}"
+            ctx.progress_cb(-1, msg=error_message)
+            logging.exception(error_message)
+            return None
 
     async def _run_raptor(
         self,
@@ -521,6 +636,9 @@ class TaskHandler:
         except Exception:
             abort_doc_chunking_counter(ctx.doc_id)
             raise
+
+        # Auto-trigger SAG extraction if enabled in parser_config
+        await self._maybe_trigger_sag_extract()
 
     async def _run_standard_chunking_impl(
         self,

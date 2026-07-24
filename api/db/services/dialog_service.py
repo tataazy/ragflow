@@ -746,6 +746,13 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                 )
                 if ck["content_with_weight"]:
                     kbinfos["chunks"].insert(0, ck)
+            # SAG augmentation (auto-triggered for SAG-enabled knowledge bases)
+            from rag.sag.retriever import augment_with_sag
+            sag_chunks = await augment_with_sag(
+                " ".join(questions), tenant_ids, dialog.kb_ids, embd_mdl, chat_mdl, kbinfos["chunks"]
+            )
+            if sag_chunks:
+                kbinfos["chunks"].extend(sag_chunks)
 
     if include_reference_metadata:
         logging.debug(

@@ -541,6 +541,14 @@ class DocumentService(CommonService):
         except Exception as e:
             logging.warning(f"Failed to cleanup knowledge graph for document {doc.id}: {e}")
 
+        # Cleanup SAG data (events/entities/associations/checkpoints/vectors)
+        try:
+            from rag.sag.cleanup import cleanup_sag_data_for_docs
+
+            cleanup_sag_data_for_docs([doc.id], doc.kb_id, tenant_id)
+        except Exception as e:
+            logging.warning(f"Failed to cleanup SAG data for document {doc.id}: {e}")
+
         return True
 
     @classmethod

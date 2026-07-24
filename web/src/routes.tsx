@@ -60,6 +60,7 @@ export enum Routes {
   Result = '/result',
   ResultView = `${Chunk}${Result}`,
   KnowledgeGraph = '/knowledge-graph',
+  Sag = '/sag',
   AgentLogPage = '/agent-log-page',
   AgentShare = '/agent/share',
   ChatShare = `${Chats}/share`,
@@ -202,6 +203,10 @@ const routeConfigOptions = [
           {
             path: `${Routes.DatasetBase}${Routes.DataSetSetting}/:id`,
             Component: () => import('@/pages/dataset/dataset-setting'),
+          },
+          {
+            path: `${Routes.DatasetBase}${Routes.Sag}/:id`,
+            Component: () => import('@/pages/sag'),
           },
         ],
       },

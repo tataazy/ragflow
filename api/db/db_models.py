@@ -666,6 +666,18 @@ def init_database_tables(alter_fields=[]):
     if create_failed_list:
         logging.error(f"create tables failed: {create_failed_list}")
         raise Exception(f"create tables failed: {create_failed_list}")
+
+    # Create SAG tables (defined in rag/sag/models.py, not auto-discovered here)
+    try:
+        from rag.sag.models import SagEvent, SagEntity, SagEventEntity, SagExtractCheckpoint
+        for sag_model in [SagEvent, SagEntity, SagEventEntity, SagExtractCheckpoint]:
+            if not sag_model.table_exists():
+                logging.debug(f"start create table {sag_model.__name__}")
+                sag_model.create_table(safe=True)
+                logging.debug(f"create table success: {sag_model.__name__}")
+    except Exception as e:
+        logging.warning(f"Failed to create SAG tables: {e}")
+
     migrate_db()
 
 
@@ -867,6 +879,8 @@ class Knowledgebase(DataBaseModel):
     artifact_task_finish_at = DateTimeField(null=True)
     skill_task_id = CharField(max_length=32, null=True, help_text="Skill generation task ID", index=True)
     skill_task_finish_at = DateTimeField(null=True)
+    sag_task_id = CharField(max_length=32, null=True, help_text="SAG extraction task ID", index=True)
+    sag_task_finish_at = DateTimeField(null=True)
 
     status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)
 

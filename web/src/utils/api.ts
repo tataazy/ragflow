@@ -128,6 +128,21 @@ export default {
   getMeta: `${restAPIv1}/datasets/metadata/flattened`,
   getKnowledgeBasicInfo: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/ingestions/summary`,
+
+  // SAG knowledge graph
+  sagGraph: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/graph`,
+  sagNodeDetail: (kbId: string, kind: string, nodeId: string) =>
+    `${restAPIv1}/sag/kb/${kbId}/nodes/${kind}/${nodeId}`,
+  sagExpand: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/expand`,
+  sagEntities: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/entities`,
+  sagEvents: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/events`,
+  sagStatus: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/status`,
+  sagRebuild: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/rebuild`,
+  sagPause: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/pause`,
+  sagResume: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/resume`,
+  sagCancel: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/cancel`,
+  sagConfig: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/config`,
+  sagDocs: (kbId: string) => `${restAPIv1}/sag/kb/${kbId}/docs`,
   // data pipeline log
   fetchDataPipelineLog: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/ingestions`,

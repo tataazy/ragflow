@@ -1,6 +1,7 @@
 import { DataFlowSelect } from '@/components/data-pipeline-select';
 import GraphRagItems from '@/components/parse-configuration/graph-rag-form-fields';
 import RaptorFormFields from '@/components/parse-configuration/raptor-form-fields';
+import SagFormFields from '@/components/parse-configuration/sag-form-fields';
 import { Button } from '@/components/ui/button';
 import {
   Card,
@@ -104,6 +105,15 @@ export default function DatasetSettings() {
           entity_types: initialEntityTypes,
           method: MethodValue.Light,
           batch_chunk_token_size: 4096,
+        },
+        sag: {
+          enabled: false,
+          extract_model: '',
+          extract_concurrency: 4,
+          chunk_max_tokens: 1000,
+          search_strategy: 'multi',
+          search_top_k: 10,
+          hop_num: 1,
         },
         metadata: {
           type: 'object',
@@ -359,6 +369,8 @@ export default function DatasetSettings() {
                         handleDeletePipelineTask(GenerateType.Raptor)
                       }
                     ></RaptorFormFields>
+                    <Divider />
+                    <SagFormFields />
                   </MainContainer>
                 </div>
 
